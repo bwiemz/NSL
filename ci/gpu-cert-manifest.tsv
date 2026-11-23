@@ -157,6 +157,9 @@ crates/nsl-cli/tests/posture_certificate_gpu.rs	posture_accumulation_identity	gp
 crates/nsl-cli/tests/pretrain_loss_decrease_gpu_e2e.rs	pretrain_loss_decreases_on_gpu	gpu	requires CUDA GPU (runs a real training loop)
 crates/nsl-cli/tests/pretrain_loss_decrease_gpu_e2e.rs	fase_deferred_matches_plain_adamw_checkpoint	gpu	requires CUDA GPU (runs two real training loops)
 crates/nsl-cli/tests/quant_block_gate.rs	a_model_on_the_gpu_goes_through_a_quant_block	gpu	requires a CUDA-capable GPU and --features cuda
+crates/nsl-cli/tests/resid_norm_fusion_gate.rs	resid_norm_fusions_are_bit_exact_under_f32_storage_gpu	gpu	requires CUDA GPU
+crates/nsl-cli/tests/resid_norm_fusion_gate.rs	resid_norm_fusions_are_bit_exact_under_bf16_storage_gpu	gpu	requires CUDA GPU
+crates/nsl-cli/tests/resid_norm_fusion_gate.rs	resid_norm_fusions_compose_with_dropout_under_bf16_storage_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/rmsnorm_dx_parity_gate.rs	fused_rmsnorm_gamma_backward_gpu_matches_reference	gpu	requires CUDA GPU
 crates/nsl-cli/tests/rmsnorm_residual_fold_gate.rs	residual_fold_bit_exact_gpu	gpu	requires CUDA GPU
 crates/nsl-cli/tests/rope_neg_fold_gate.rs	rope_fold_bit_exact_gpu	gpu	requires CUDA GPU
@@ -477,6 +480,8 @@ crates/nsl-runtime/src/tensor_parallel/collective.rs	a_real_one_rank_communicato
 crates/nsl-runtime/src/tensor_parallel/collective.rs	nccl_device_collectives_actually_execute_on_this_gpu	gpu	requires CUDA GPU + a real libnccl (--features nccl)
 crates/nsl-runtime/src/tensor_parallel/collective.rs	unmapped_dtypes_are_refused_before_reaching_nccl	gpu	requires CUDA GPU + a real libnccl (--features nccl)
 crates/nsl-runtime/src/tensor_parallel/collective.rs	the_trait_methods_short_circuit_at_ws1_without_entering_nccl	gpu	requires CUDA GPU + a real libnccl (--features nccl)
+crates/nsl-runtime/tests/add_rmsnorm_gpu.rs	the_fused_launch_equals_the_add_and_the_norm_bit_for_bit_on_every_route	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/add_rmsnorm_gpu.rs	a_broadcast_operand_takes_the_pair_of_calls_and_is_counted	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/bf16_storage_copy_gpu.rs	bf16_views_copy_to_row_major_bit_for_bit	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/bf16_storage_gemm_gpu.rs	bf16_operand_gemms_round_once_to_the_requested_dtype	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/bf16_storage_gemm_gpu.rs	the_fused_weight_gradient_accumulates_bf16_activations_in_f32	gpu	requires CUDA GPU
@@ -532,6 +537,10 @@ crates/nsl-runtime/tests/hwcert_kir_numerics_gpu.rs	dropout_kir_kernel_is_bit_ex
 crates/nsl-runtime/tests/hwcert_kir_numerics_gpu.rs	dropout_regenerated_mask_is_bit_exact_against_the_stored_mask_on_silicon	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/inspect_ffi.rs	gpu_stats_parity_with_cpu	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/kernel_launch_tensors_gpu.rs	kernel_launch_tensors_vec_add_writes_correct_output	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/matmul_acc_bf16_mode_gpu.rs	route_zero_in_the_bf16_math_mode_equals_the_eager_matmul_and_the_add_bit_for_bit	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/matmul_acc_gpu.rs	the_accumulating_gemm_equals_the_gemm_and_the_add_bit_for_bit	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/matmul_acc_gpu.rs	a_product_shaped_unlike_the_accumulator_and_route_zero_take_the_three_calls	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/matmul_acc_gpu.rs	a_bf16_sum_replays_the_unfused_bf16_gemm_reduce_and_add	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_batch_collapse.rs	the_projection_shape_reaches_cublas	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_batch_collapse.rs	both_arms_agree_with_the_cpu_reference	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_batch_collapse.rs	a_transposed_operand_still_computes_the_right_product	gpu	requires CUDA GPU

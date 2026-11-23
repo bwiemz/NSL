@@ -271,6 +271,7 @@ pub fn has_dt_lowering(op: &PrimalOp) -> bool {
         || is_passthrough(op, "reduce_to_shape")
         || is_passthrough(op, "rope")
         || is_passthrough(op, "rope_backward")
+        || is_passthrough(op, "matmul_acc")
 }
 
 /// Ops whose result has their (first) input's storage and that the runtime
@@ -428,6 +429,15 @@ pub fn select_bf16_params(
             for r in rd.get(&x).map(Vec::as_slice).unwrap_or_default() {
                 match &r.op {
                     PrimalOp::Matmul => gemm = true,
+                    // A summed input gradient's GEMM (`source_ad::fuse_dgrad_accumulate`)
+                    // reads its two GEMM operands as a Matmul does; its accumulator
+                    // (operand 2) is a gradient, never a parameter.
+                    PrimalOp::Passthrough(n)
+                        if n == "matmul_acc"
+                            && r.inputs.iter().position(|&i| i == x).is_some_and(|k| k < 2) =>
+                    {
+                        gemm = true
+                    }
                     // Views keep the parameter's data pointer, which is how
                     // the runtime finds its exact f32 master
                     // (`param_storage::exact_f32`); a `contiguous` copy
@@ -626,6 +636,29 @@ impl Planner<'_> {
                     // the eager bf16 mode, whose per-shape rule it keeps.
                     if op
                         .inputs
+                        .iter()
+                        .all(|i| !self.is_bf16(*i) || self.param_view.contains(i))
+                    {
+                        self.plan.param_gemm.insert(op.result);
+                    }
+                    self.set(op, Storage::F32);
+                }
+                Ok(())
+            }
+            PrimalOp::Passthrough(name) if name == "matmul_acc" => {
+                // A gradient summed from several GEMMs (`source_ad::fuse_dgrad_accumulate`),
+                // stored as the sum it replaces was. Its accumulator `c` is the sum so far
+                // for the same value, stored as rule 6 says for that value: f32 for a norm
+                // output (the production blocks), where the unfused dgrads were f32 GEMM
+                // outputs added in f32; bf16 where the value's gradient is bf16, where the
+                // unfused dgrad (rule 4), its reduce and the add were all bf16 (the
+                // lowering then replays exactly those three ops). An f32 sum is planned
+                // when it reads a bf16 value; like a Matmul, through the eager rule when
+                // its only bf16 operands are stored parameters.
+                if self.is_bf16(op.inputs[2]) {
+                    self.set(op, Storage::Bf16);
+                } else if reads_bf16 {
+                    if op.inputs[..2]
                         .iter()
                         .all(|i| !self.is_bf16(*i) || self.param_view.contains(i))
                     {
@@ -1230,6 +1263,62 @@ mod tests {
         for v in [520, 512, 519, 496, 497, 525] {
             assert!(!got.out.contains_key(&v) && !got.bf16.contains(&v), "VarId {v} must stay f32");
         }
+    }
+
+    /// [`block`] with the gate/up input-gradient sum accumulated by the gate dgrad's
+    /// GEMM (`source_ad::fuse_dgrad_accumulate`: `520 = matmul_acc(516, 517, 512)`,
+    /// the gate dgrad 518 and its reduce 519 gone).
+    fn block_with_dgrad_accumulation() -> (WengertList, WengertList, HashMap<VarId, VarId>) {
+        let (primal, mut adjoint, clones) = block();
+        adjoint.ops.retain(|o| o.result != 518 && o.result != 519);
+        for o in adjoint.ops.iter_mut().filter(|o| o.result == 520) {
+            o.op = pt("matmul_acc");
+            o.inputs = vec![516, 517, 512];
+        }
+        (primal, adjoint, clones)
+    }
+
+    /// The summed gradient of the norm output stays f32: the accumulation reads a bf16
+    /// gradient and is planned f32 (dtype-explicit), the first term's dgrad as before;
+    /// everything else is planned as without the accumulation. And a matrix whose
+    /// gradient GEMM became an accumulation is still a GEMM-only parameter.
+    #[test]
+    fn a_dgrad_accumulation_is_planned_f32_and_its_weight_stays_a_gemm_parameter() {
+        use Storage::F32;
+        let (primal, adjoint, clones) = block();
+        let base = plan(&primal, &adjoint, &clones).expect("plans");
+        let (primal, adjoint, clones) = block_with_dgrad_accumulation();
+        let got = plan(&primal, &adjoint, &clones).expect("plans");
+        assert_eq!(got.out.get(&520), Some(&F32));
+        assert!(!got.bf16.contains(&520) && !got.param_gemm.contains(&520));
+        let mut want = base.out.clone();
+        want.remove(&518);
+        want.insert(520, F32);
+        assert_eq!(got.out, want);
+        assert_eq!(
+            got.out.get(&511),
+            Some(&F32),
+            "the first term's dgrad is unchanged"
+        );
+        let paths = ["wo", "ffn_norm.weight", "w_gate", "w_up", "w_down"];
+        let index_of = |n: &str| paths.iter().position(|p| *p == n);
+        let sel = select_bf16_params(&primal, &adjoint, &index_of);
+        assert_eq!(sel, vec![(126, 0), (133, 2), (136, 3), (139, 4)]);
+        // A value whose gradient is bf16: its first term's dgrad and reduce are bf16
+        // (rules 4-6), so the accumulation is planned bf16 as the unfused sum was.
+        let (primal, mut adjoint, clones) = block_with_dgrad_accumulation();
+        let bf16_sum = op(990, pt("matmul_acc"), &[508, 510, 509]);
+        adjoint.ops.push(bf16_sum);
+        let got_b = plan(&primal, &adjoint, &clones).expect("plans");
+        assert_eq!(got_b.out.get(&509), Some(&Storage::Bf16), "the fixture's accumulator is bf16");
+        assert_eq!(got_b.out.get(&990), Some(&Storage::Bf16));
+        assert!(got_b.bf16.contains(&990) && !got_b.param_gemm.contains(&990));
+        // With the parameters stored, the accumulation reads a bf16 gradient as well as
+        // the stored weight: the storage route, not the eager rule.
+        let params: HashSet<VarId> = [126, 133, 136, 139].into_iter().collect();
+        let got = plan_with_params(&primal, &adjoint, &clones, &[], &params, true).expect("plans");
+        assert_eq!(got.out.get(&520), Some(&F32));
+        assert!(!got.param_gemm.contains(&520));
     }
 
     /// `param_dtype=`: the four matrices of the MLP block (`wo` too: its only
