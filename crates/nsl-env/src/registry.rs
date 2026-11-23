@@ -1239,6 +1239,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "Disaggregated-inference worker role for this process: router (default, monolithic), prefill, or decode."
     ),
     var!(
+        "NSL_ROPE_BWD_BF16",
+        Bool,
+        "0 only",
+        "on (precision=\"bf16\": a RoPE adjoint only GEMMs read is stored bf16)",
+        Behavior,
+        Compile,
+        "Set to 0 at build time to keep the RoPE adjoint's q/k gradients f32 under precision=\"bf16\" (each GEMM then rounds them itself)."
+    ),
+    var!(
         "NSL_RUNTIME_LIB_PATH_OVERRIDE",
         Path,
         "existing path to the nsl runtime static library; a missing path is silently ignored",
