@@ -38,11 +38,11 @@ pub(crate) fn run_test(file: &PathBuf, filter: Option<&str>) {
     }
 
     // Write object file and link to a temp executable
-    let temp_dir = std::env::temp_dir().join(format!("nsl_test_{}", std::process::id()));
-    if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-        nsl_log::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
-        process::exit(1);
-    }
+    let temp_dir = crate::commands::build::create_scratch_dir(&format!("nsl_test_{}", std::process::id()))
+        .unwrap_or_else(|e| {
+            nsl_log::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
+            process::exit(1);
+        });
 
     let stem = file
         .file_stem()
@@ -101,8 +101,7 @@ pub(crate) fn run_test(file: &PathBuf, filter: Option<&str>) {
     }
 
     // Clean up
-    let _ = std::fs::remove_file(&exe_path);
-    let _ = std::fs::remove_dir(&temp_dir);
+    crate::commands::build::cleanup_temp_dir(&temp_dir);
 
     // Summary
     println!("\n{passed} passed, {failed} failed");

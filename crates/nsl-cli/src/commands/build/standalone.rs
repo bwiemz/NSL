@@ -99,11 +99,11 @@ pub(crate) fn run_build_standalone(
         .unwrap_or_else(|e| crate::pipeline::exit_on_codegen_error(&source_map, &e, None));
 
     // 7. Write main object file
-    let temp_dir = std::env::temp_dir().join(format!("nsl_standalone_{}", std::process::id()));
-    if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-        nsl_log::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
-        process::exit(1);
-    }
+    let temp_dir = super::create_scratch_dir(&format!("nsl_standalone_{}", std::process::id()))
+        .unwrap_or_else(|e| {
+            nsl_log::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
+            process::exit(1);
+        });
 
     let main_obj_path = temp_dir.join("main.o");
     if let Err(e) = std::fs::write(&main_obj_path, &obj_bytes) {

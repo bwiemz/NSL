@@ -126,6 +126,8 @@ fn forward_and_named_call_produce_identical_outputs() {
     assert_eq!(out_a, out_b, "outputs must be bit-identical");
 
     nsl_runtime::c_api::nsl_model_destroy(model);
+    // The library and its ~140 MB of statically linked runtime are scratch.
+    let _ = std::fs::remove_dir_all(lib.parent().unwrap());
 }
 /// Path to the `nsl` binary built by `cargo test --workspace`.
 ///

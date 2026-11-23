@@ -56,6 +56,8 @@ fn beta(x: Tensor<[4], f32>) -> Tensor<[4], f32>:
     assert!(registry.lookup("alpha").is_some());
     assert!(registry.lookup("beta").is_some());
     assert!(registry.lookup("does_not_exist").is_none());
+    // The library and its ~140 MB of statically linked runtime are scratch.
+    let _ = std::fs::remove_dir_all(lib_path.parent().unwrap());
 }
 
 #[test]

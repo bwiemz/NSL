@@ -37,11 +37,78 @@ mod wrga_check;
 ///
 /// Set `NSL_KEEP_TEMP=1` to retain the directory for debugging.
 pub(crate) fn cleanup_temp_dir(dir: &std::path::Path) {
+    // This path has dealt with the directory, so the exit hook need not.
+    if let Ok(mut dirs) = SCRATCH_DIRS.lock() {
+        dirs.retain(|d| d != dir);
+    }
+    remove_unless_kept(dir);
+}
+
+fn remove_unless_kept(dir: &std::path::Path) {
     if std::env::var("NSL_KEEP_TEMP").as_deref() == Ok("1") {
         nsl_log::nsl_log!(INFO, "nsl", "[nsl] NSL_KEEP_TEMP=1 — retaining {}", dir.display());
         return;
     }
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Scratch directories this process made and no path has cleaned up yet.
+static SCRATCH_DIRS: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Create the compile-scratch directory `<temp dir>/<name>`, and remove it when
+/// the process exits unless a path has already called [`cleanup_temp_dir`] on it.
+///
+/// Only the success paths reach `cleanup_temp_dir`. A type error, a refused
+/// flag, a codegen error or a failed link leaves through `process::exit` from
+/// deep inside the build, past it, and the directory stayed behind with its
+/// objects (and, for `nsl run`, a 100-270 MB unstripped executable). Test suites
+/// exercise those paths by the thousand: on 2026-11-23 4,798 `nsl_build_<pid>`
+/// directories (5.4 GB) sat in a 31 GB `/tmp` tmpfs that test leftovers had
+/// filled, and every link on the machine failed. `process::exit` runs the C
+/// `atexit` handlers, so registering the directory once covers every exit.
+/// A process killed by a signal still leaves it.
+pub(crate) fn create_scratch_dir(name: &str) -> std::io::Result<std::path::PathBuf> {
+    let dir = std::env::temp_dir().join(name);
+    std::fs::create_dir_all(&dir)?;
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        unsafe extern "C" {
+            fn atexit(cb: extern "C" fn()) -> i32;
+        }
+        // SAFETY: `atexit` (C, available on glibc and MSVCRT/UCRT, as in
+        // nsl-runtime's args.rs) takes a plain `extern "C" fn()`, and
+        // `remove_scratch_dirs_at_exit` never unwinds.
+        unsafe {
+            atexit(remove_scratch_dirs_at_exit);
+        }
+    });
+    if let Ok(mut dirs) = SCRATCH_DIRS.lock()
+        && !dirs.contains(&dir)
+    {
+        dirs.push(dir.clone());
+    }
+    Ok(dir)
+}
+
+/// Exempt a scratch directory from removal at exit: it holds the command's
+/// output (`nsl build --emit-obj` of a multi-module program reports objects there).
+pub(crate) fn keep_scratch_dir(dir: &std::path::Path) {
+    if let Ok(mut dirs) = SCRATCH_DIRS.lock() {
+        dirs.retain(|d| d != dir);
+    }
+}
+
+extern "C" fn remove_scratch_dirs_at_exit() {
+    // An unwind out of an `extern "C"` fn aborts; a failure to clean up must not.
+    let _ = std::panic::catch_unwind(|| {
+        // `try_lock`: a thread holding the lock while the process exits must not hang the exit.
+        let Ok(dirs) = SCRATCH_DIRS.try_lock() else {
+            return;
+        };
+        for dir in dirs.iter() {
+            remove_unless_kept(dir);
+        }
+    });
 }
 
 pub(crate) use normal::{run_build, run_build_inner};
