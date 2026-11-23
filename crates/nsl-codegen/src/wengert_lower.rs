@@ -144,8 +144,58 @@ pub struct FaseInplaceAccum {
 
 /// `NSL_TIED_EMBED_INPLACE=0` (compile time) keeps a tied embedding's
 /// gradient materialised and summed (see [`crate::tied_embed_fusion`]).
-fn tied_embed_inplace_enabled() -> bool {
+pub(crate) fn tied_embed_inplace_enabled() -> bool {
     std::env::var("NSL_TIED_EMBED_INPLACE").ok().as_deref() != Some("0")
+}
+
+/// `NSL_LCE_GRAD_IN_FORWARD=0` (compile time) keeps every fused LM head's
+/// gradient in its backward (see [`crate::lce_grad_in_forward`]).
+pub(crate) fn lce_grad_in_forward_enabled() -> bool {
+    std::env::var("NSL_LCE_GRAD_IN_FORWARD").ok().as_deref() != Some("0")
+}
+
+/// Test harness only: `NSL_LCE_GIF_TEST_ASSUMED_GRAD=<f32>` (compile time)
+/// makes a planned head's forward assume that upstream gradient instead of
+/// the loss seed's literal, so a gate can show the backward's check stops the
+/// program when the two differ.
+fn lce_gif_assumed_grad(seed: f64) -> f32 {
+    std::env::var("NSL_LCE_GIF_TEST_ASSUMED_GRAD")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .unwrap_or(seed as f32)
+}
+
+/// What the lowering of a train step's LM heads planned by
+/// [`crate::lce_grad_in_forward`] needs: the plan, and the FASE accumulation
+/// buffers the forward adds each head's weight gradient into. Installed on
+/// the compiler (`Compiler::lce_gif`) by the train driver around the step's
+/// forward and adjoint lowerings.
+#[derive(Debug, Clone)]
+pub struct LceGifLowering {
+    pub plan: crate::lce_grad_in_forward::LceGifPlan,
+    /// The accumulation buffer list (`m_partial` per parameter).
+    pub accum_list: Value,
+    /// Parameter-adjoint VarId -> its index in `accum_list`.
+    pub idx_of: HashMap<VarId, i64>,
+    /// `1 / grad_accumulation`: the weight gradient's alpha.
+    pub scale: f64,
+    /// Heads whose forward was lowered (exactly once each).
+    pub forwards: std::collections::HashSet<VarId>,
+    /// Extract components lowered per head.
+    pub extracts: HashMap<VarId, u8>,
+    /// Heads whose input the forward freed.
+    pub freed_x: usize,
+}
+
+impl LceGifLowering {
+    fn head(&self, key: VarId) -> Option<crate::lce_grad_in_forward::LceGifHead> {
+        self.plan.by_key.get(&key).copied()
+    }
+}
+
+/// The planned head whose forward `key` is, if any.
+fn lce_gif_head(compiler: &Compiler, key: VarId) -> Option<crate::lce_grad_in_forward::LceGifHead> {
+    compiler.lce_gif.as_ref().and_then(|g| g.head(key))
 }
 
 /// `m_partial` and the scale for the parameter adjoint `param_adjoint`, read
@@ -689,6 +739,50 @@ fn compile_wengert_ops_range_inner(
             call(compiler, builder, "nsl_arena_unbind_verify", &[result_val])?;
         }
         var_map.insert(op.result, result_val);
+        // A head whose forward computed its gradient (`crate::lce_grad_in_forward`):
+        // its input is dead once the head ran, when the plan proved no other
+        // op reads it. Freed only if this lowering owns it (an owned tensor
+        // the bulk free would otherwise release at the end of the step), and
+        // recorded so that free skips it.
+        if let Some(head) = lce_gif_head(compiler, op.result).filter(|h| h.free_x) {
+            let owned = owned_values
+                .iter()
+                .any(|(v, _, ty)| *v == head.x && *ty == WengertType::Tensor);
+            if owned
+                && !explicit_freed_vars.contains(&head.x)
+                && !compiler.arena_placements.contains_key(&head.x)
+                && let Some(&x_val) = var_map.get(&head.x)
+                && builder.func.dfg.value_type(x_val) == cl_types::I64
+            {
+                call(compiler, builder, "nsl_tensor_free", &[x_val])?;
+                explicit_freed_vars.insert(head.x);
+                if let Some(g) = compiler.lce_gif.as_mut() {
+                    g.freed_x += 1;
+                }
+            }
+        }
+        // The weight gradient of such a head, when it IS the parameter's
+        // adjoint: it is already in the accumulation buffer (the extract's
+        // result is a placeholder), so the hook only learns that.
+        if let Some(ref mut hook) = on_param_grad
+            && hook.0.contains(&op.result)
+            && compiler
+                .lce_gif
+                .as_ref()
+                .is_some_and(|g| g.plan.direct_dw(op.result).is_some())
+        {
+            let (_, cb) = hook;
+            cb(
+                compiler,
+                op.result,
+                ParamGradSource::AccumulatedInPlace,
+                false,
+                builder,
+            )?;
+            hook_freed_param_vars.insert(op.result);
+            var_types.insert(op.result, WengertType::Integer);
+            continue;
+        }
         // FASE hook: consume parameter gradients immediately during lowering.
         if let Some(ref mut hook) = on_param_grad {
             let (param_set, cb) = hook;
@@ -2745,20 +2839,55 @@ fn lower_single_op(
             ignore_index,
             is_large,
             has_bias,
-            x_rank3: _,
-        } => lower_fused_linear_ce_forward(
-            compiler,
-            builder,
-            &inputs,
-            *vocab_size,
-            *hidden_size,
-            *batch_size,
-            *seq_len,
-            *vocab_tile,
-            *ignore_index,
-            *is_large,
-            *has_bias,
-        ),
+            x_rank3,
+        } => {
+            // A head planned to compute its gradient here (training only:
+            // the plan exists only around a train step's lowering).
+            let gif = match lce_gif_head(compiler, op.result) {
+                Some(head) => {
+                    let g = compiler
+                        .lce_gif
+                        .as_mut()
+                        .expect("the head came from the plan");
+                    if !g.forwards.insert(op.result) {
+                        return Err(CodegenError::new(format!(
+                            "internal: the forward of LM head {} was lowered twice; its weight \
+                             gradient would be added twice",
+                            op.result
+                        )));
+                    }
+                    let idx = *g.idx_of.get(&head.param_adjoint).ok_or_else(|| {
+                        CodegenError::new(format!(
+                            "internal: LM head {} adds its weight gradient into parameter adjoint {}, \
+                             which has no accumulation buffer",
+                            op.result, head.param_adjoint
+                        ))
+                    })?;
+                    Some(LceGifForward {
+                        head,
+                        accum_list: g.accum_list,
+                        accum_idx: idx,
+                        scale: g.scale,
+                        x_rank3: *x_rank3,
+                    })
+                }
+                None => None,
+            };
+            lower_fused_linear_ce_forward(
+                compiler,
+                builder,
+                &inputs,
+                *vocab_size,
+                *hidden_size,
+                *batch_size,
+                *seq_len,
+                *vocab_tile,
+                *ignore_index,
+                *is_large,
+                *has_bias,
+                gif,
+            )
+        }
         // CFTP §4.4 G3 (Sprint 4): fused linear-CE backward extract.
         // Mirrors `FlashAttentionBackwardExtract` — first component fires
         // the backward FFI and caches outputs; subsequent components hit
@@ -2774,13 +2903,29 @@ fn lower_single_op(
             has_bias,
             x_rank3,
         } => {
-            // A tied embedding planned in place: the backward launch writes
-            // dW into the embedding's accumulation buffer.
-            let tied = match op
+            let tied_adjoint = op
                 .inputs
                 .get(5)
-                .and_then(|k| tied_plan_entry(compiler, |p| p.by_lce_key.get(k).copied()))
-            {
+                .and_then(|k| tied_plan_entry(compiler, |p| p.by_lce_key.get(k).copied()));
+            // A head whose forward computed its gradient: hand the saved x
+            // gradient on, after checking the upstream gradient.
+            if let Some(head) = op.inputs.get(5).and_then(|&k| lce_gif_head(compiler, k)) {
+                if head.tied != tied_adjoint.is_some() {
+                    return Err(CodegenError::new(format!(
+                        "internal: LM head {} was planned with tied = {} but the tied-embedding plan \
+                         of the adjoint lowering says {}",
+                        head.key,
+                        head.tied,
+                        tied_adjoint.is_some()
+                    )));
+                }
+                return lower_fused_linear_ce_saved_grad(
+                    compiler, builder, &inputs, *component, *has_bias, head,
+                );
+            }
+            // A tied embedding planned in place: the backward launch writes
+            // dW into the embedding's accumulation buffer.
+            let tied = match tied_adjoint {
                 Some(param_adjoint) => Some(fase_inplace_target(compiler, builder, param_adjoint)?),
                 None => None,
             };
@@ -4754,7 +4899,7 @@ fn build_fused_ce_cfg(
 /// the PTX bytes carry the dtype-specialised cvt instructions and the
 /// runtime dispatch tag must match so the launcher chooses the same
 /// path. Hence a single source of truth.
-fn fused_ce_dtype_for_compiler(
+pub(crate) fn fused_ce_dtype_for_compiler(
     compiler: &crate::compiler::Compiler,
 ) -> (i64, crate::fused_linear_ce::Dtype) {
     use crate::FusedCeDtypeHint;
@@ -5175,6 +5320,20 @@ fn emit_fused_lce_hint_pin(
     Ok(())
 }
 
+/// What a planned head's forward (`crate::lce_grad_in_forward`) writes its
+/// gradient with.
+#[derive(Debug, Clone, Copy)]
+struct LceGifForward {
+    head: crate::lce_grad_in_forward::LceGifHead,
+    accum_list: Value,
+    /// The weight's index in `accum_list`.
+    accum_idx: i64,
+    /// `1 / grad_accumulation`.
+    scale: f64,
+    /// dx is `[B, S, H]` (else `[B*S, H]`), as the backward allocates it.
+    x_rank3: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn lower_fused_linear_ce_forward(
     compiler: &mut crate::compiler::Compiler,
@@ -5188,6 +5347,7 @@ fn lower_fused_linear_ce_forward(
     ignore_index: i64,
     is_large: bool,
     has_bias: bool,
+    gif: Option<LceGifForward>,
 ) -> Result<Value, CodegenError> {
     // CFTP v5: read dtype hint from the active `@fused_lm_ce` decorator.
     // Both the emitter cfg AND the FFI dtype_tag must agree; a single
@@ -5268,6 +5428,23 @@ fn lower_fused_linear_ce_forward(
     let w_t = inputs[1];
     let bias_t = inputs[2];
     let targets_t = inputs[3];
+
+    if let Some(g) = gif {
+        if !use_gemm || has_bias || dtype_tag != 0 {
+            return Err(CodegenError::new(format!(
+                "internal: LM head {} was planned to compute its gradient in the forward, but it does \
+                 not take the biasless f32 GEMM route (bias {has_bias}, dtype_tag {dtype_tag}, gemm {use_gemm})",
+                g.head.key
+            )));
+        }
+        return lower_fused_linear_ce_forward_with_grad(
+            compiler,
+            builder,
+            [x_t, w_t, targets_t],
+            [batch_size, seq_len, vocab_size, hidden_size],
+            g,
+        );
+    }
 
     // Allocate per-row output buffers on GPU.
     let loss_out = alloc_gpu_f32_tensor(compiler, builder, &[rows])?;
@@ -5563,6 +5740,225 @@ fn lower_fused_linear_ce_forward(
         .fused_ce_fwd_casts
         .insert(result, (x_t_for_ffi, w_t_for_ffi, bias_t_for_ffi, dtype_tag));
     Ok(result)
+}
+
+/// The forward of a head planned by [`crate::lce_grad_in_forward`]: the
+/// head's loss as [`lower_fused_linear_ce_forward`] returns it, and its whole
+/// backward in the same launch (`nsl_fused_linear_ce_forward_gemm_grad`):
+/// the weight gradient added, times `1/N`, into the parameter's accumulation
+/// buffer, the x gradient saved for the backward extract
+/// (`Compiler::lce_gif_dx`). The valid-row count, which the backward used to
+/// compute, comes first: the gradient's scale needs it.
+fn lower_fused_linear_ce_forward_with_grad(
+    compiler: &mut crate::compiler::Compiler,
+    builder: &mut FunctionBuilder,
+    [x_t, w_t, targets_t]: [Value; 3],
+    [batch_size, seq_len, vocab_size, hidden_size]: [u32; 4],
+    g: LceGifForward,
+) -> Result<Value, CodegenError> {
+    let rows = (batch_size as i64) * (seq_len as i64);
+    // valid_mask[i] = clamp(targets[i] + 1, 0, 1); num_valid = sum(valid_mask),
+    // as the forward's mean and the backward's scale both took it.
+    let one_f = builder.ins().f64const(1.0);
+    let zero_f = builder.ins().f64const(0.0);
+    let eps_f = builder.ins().f64const(1e-8);
+    let addsc_flags = builder.ins().iconst(cl_types::I8, 0);
+    let targets_plus_one = call(
+        compiler,
+        builder,
+        "nsl_tensor_add_scalar",
+        &[targets_t, one_f, addsc_flags],
+    )?;
+    let valid_mask = call(
+        compiler,
+        builder,
+        "nsl_tensor_clamp",
+        &[targets_plus_one, zero_f, one_f],
+    )?;
+    let num_valid_t = call(compiler, builder, "nsl_tensor_sum", &[valid_mask])?;
+    let num_valid_f64 = call(compiler, builder, "nsl_tensor_item", &[num_valid_t])?;
+    let num_valid = builder.ins().fcvt_to_sint(cl_types::I64, num_valid_f64);
+
+    let x_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[x_t])?;
+    let w_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[w_t])?;
+    let expected_rows_v = builder.ins().iconst(cl_types::I64, rows);
+    let tgt_vocab_v = builder.ins().iconst(cl_types::I64, vocab_size as i64);
+    let tgt_site_v = builder
+        .ins()
+        .iconst(cl_types::I64, FUSED_TARGETS_SITE_LM_CE);
+    let tgt_ptr = call(
+        compiler,
+        builder,
+        "nsl_fused_lce_targets_i64_alloc",
+        &[targets_t, expected_rows_v, tgt_vocab_v, tgt_site_v],
+    )?;
+    emit_fused_lce_hint_pin(
+        compiler,
+        builder,
+        x_t,
+        w_t,
+        batch_size,
+        seq_len,
+        vocab_size,
+        hidden_size,
+        FusedCePinSite::Lm,
+    )?;
+    let loss_out = alloc_gpu_f32_tensor(compiler, builder, &[rows])?;
+    let loss_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[loss_out])?;
+    // dx, zeroed (the vocabulary-chunked route accumulates into it), shaped
+    // as the backward extract allocated it; none when nothing reads it.
+    let dx_out = match g.head.dx {
+        Some(_) if g.x_rank3 => Some(alloc_gpu_f32_tensor(
+            compiler,
+            builder,
+            &[batch_size as i64, seq_len as i64, hidden_size as i64],
+        )?),
+        Some(_) => Some(alloc_gpu_f32_tensor(
+            compiler,
+            builder,
+            &[rows, hidden_size as i64],
+        )?),
+        None => None,
+    };
+    let dx_ptr = match dx_out {
+        Some(t) => call(compiler, builder, "nsl_tensor_data_ptr", &[t])?,
+        None => builder.ins().iconst(cl_types::I64, 0),
+    };
+    let idx_v = builder.ins().iconst(cl_types::I64, g.accum_idx);
+    let m_partial = call(compiler, builder, "nsl_list_get", &[g.accum_list, idx_v])?;
+    let b_val = builder.ins().iconst(cl_types::I64, batch_size as i64);
+    let s_val = builder.ins().iconst(cl_types::I64, seq_len as i64);
+    let v_val = builder.ins().iconst(cl_types::I64, vocab_size as i64);
+    let h_val = builder.ins().iconst(cl_types::I64, hidden_size as i64);
+    let grad_bits = builder.ins().iconst(
+        cl_types::I64,
+        i64::from(lce_gif_assumed_grad(g.head.seed).to_bits()),
+    );
+    let alpha_bits = builder
+        .ins()
+        .iconst(cl_types::I64, i64::from((g.scale as f32).to_bits()));
+    let _rc = call(
+        compiler,
+        builder,
+        "nsl_fused_linear_ce_forward_gemm_grad",
+        &[
+            x_ptr, w_ptr, tgt_ptr, loss_ptr, dx_ptr, m_partial, b_val, s_val, v_val, h_val,
+            num_valid, grad_bits, alpha_bits,
+        ],
+    )?;
+    call(
+        compiler,
+        builder,
+        "nsl_fused_lce_targets_i64_free",
+        &[tgt_ptr],
+    )?;
+
+    // The masked mean, as the forward without the gradient takes it.
+    let mul_flags = builder.ins().iconst(cl_types::I8, 0);
+    let masked_loss = call(
+        compiler,
+        builder,
+        "nsl_tensor_mul",
+        &[loss_out, valid_mask, mul_flags],
+    )?;
+    let addsc_flags2 = builder.ins().iconst(cl_types::I8, 0);
+    let num_valid_eps = call(
+        compiler,
+        builder,
+        "nsl_tensor_add_scalar",
+        &[num_valid_t, eps_f, addsc_flags2],
+    )?;
+    let total = call(compiler, builder, "nsl_tensor_sum", &[masked_loss])?;
+    let div_flags = builder.ins().iconst(cl_types::I8, 0);
+    let result = call(
+        compiler,
+        builder,
+        "nsl_tensor_div",
+        &[total, num_valid_eps, div_flags],
+    )?;
+    for tmp in [
+        targets_plus_one,
+        valid_mask,
+        masked_loss,
+        num_valid_t,
+        num_valid_eps,
+        total,
+        loss_out,
+    ] {
+        free_tensor_value(compiler, builder, tmp)?;
+    }
+    if let Some(dx) = dx_out {
+        compiler.lce_gif_dx.insert(result, dx);
+    }
+    Ok(result)
+}
+
+/// The backward extract of a head whose forward computed its gradient: the
+/// first component lowered checks that the upstream gradient is the value
+/// the forward assumed (the program stops otherwise) and takes the saved x
+/// gradient; the weight-gradient component is a placeholder (the gradient is
+/// in the accumulation buffer, and the FASE hook is told so).
+fn lower_fused_linear_ce_saved_grad(
+    compiler: &mut crate::compiler::Compiler,
+    builder: &mut FunctionBuilder,
+    inputs: &[Value],
+    component: u8,
+    has_bias: bool,
+    head: crate::lce_grad_in_forward::LceGifHead,
+) -> Result<Value, CodegenError> {
+    if has_bias || component > 1 {
+        return Err(CodegenError::new(format!(
+            "internal: LM head {} computes its gradient in the forward but its backward asks for \
+             component {component} (bias {has_bias})",
+            head.key
+        )));
+    }
+    let key_val = inputs[5];
+    let slot = if let Some(&cached) = compiler.fused_ce_bwd_cache.get(&key_val) {
+        cached
+    } else {
+        let assumed = builder.ins().iconst(
+            cl_types::I64,
+            i64::from(lce_gif_assumed_grad(head.seed).to_bits()),
+        );
+        call(
+            compiler,
+            builder,
+            "nsl_fused_lce_check_upstream_grad",
+            &[inputs[0], assumed],
+        )?;
+        let zero = builder.ins().iconst(cl_types::I64, 0);
+        let dx = match head.dx {
+            Some(_) => compiler.lce_gif_dx.remove(&key_val).ok_or_else(|| {
+                CodegenError::new(format!(
+                    "internal: LM head {} computes its gradient in the forward, but no saved x gradient \
+                     reached its backward (was the forward lowered?)",
+                    head.key
+                ))
+            })?,
+            None => zero,
+        };
+        let slot = [dx, zero, zero];
+        compiler.fused_ce_bwd_cache.insert(key_val, slot);
+        slot
+    };
+    if component == 0 && head.dx.is_none() {
+        return Err(CodegenError::new(format!(
+            "internal: LM head {} was planned without an x gradient, but its backward reads one",
+            head.key
+        )));
+    }
+    let expected = 1 + u8::from(head.dx.is_some());
+    let g = compiler
+        .lce_gif
+        .as_mut()
+        .expect("the head came from the plan");
+    let seen = g.extracts.entry(head.key).or_insert(0);
+    *seen += 1;
+    if *seen == expected {
+        compiler.fused_ce_bwd_cache.remove(&key_val);
+    }
+    Ok(slot[component as usize])
 }
 
 #[allow(clippy::too_many_arguments)]

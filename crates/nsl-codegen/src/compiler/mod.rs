@@ -817,6 +817,14 @@ pub struct Compiler<'a> {
     /// The tied-embedding plan of the adjoint tape being lowered (see
     /// `crate::tied_embed_fusion`), set by `compile_wengert_ops_range`.
     pub(crate) tied_embed_plan: Option<crate::tied_embed_fusion::TiedEmbedPlan>,
+    /// The LM heads of the train step being lowered whose gradient is
+    /// computed in their forward (`crate::lce_grad_in_forward`), with what
+    /// the forward needs to write it: installed by the train driver before
+    /// the step's forward lowering and cleared after its adjoint lowering.
+    pub(crate) lce_gif: Option<crate::wengert_lower::LceGifLowering>,
+    /// The x gradient such a head's forward computed, keyed by the
+    /// `FusedLinearCe` result Value; taken by its backward extract.
+    pub(crate) lce_gif_dx: HashMap<Value, Value>,
     /// Gap C (CSHA fused backward): seven-slot side-channel keyed by the
     /// Cranelift Value Gap D chooses as the "chain key" (see
     /// `PrimalOp::CshaFusedBackwardExtract` in `wengert.rs`).  The eight
@@ -1307,6 +1315,8 @@ impl<'a> Compiler<'a> {
             grad_live_results: None,
             fase_inplace: None,
             tied_embed_plan: None,
+            lce_gif: None,
+            lce_gif_dx: HashMap::new(),
             csha_fused_bwd_cache: HashMap::new(),
             fused_ce_fwd_lse: HashMap::new(),
             fused_ce_fwd_casts: HashMap::new(),

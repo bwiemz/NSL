@@ -24,6 +24,7 @@ pub mod flash_attn;
 pub mod flash_lse;
 pub mod lce_chunk;
 pub mod lce_finalize;
+pub mod lce_rows;
 pub mod lookup;
 pub mod maxpool;
 pub mod muon_batch;

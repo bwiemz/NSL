@@ -280,6 +280,12 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
          embedding scatter add into its accumulation buffer",
     ),
     m(
+        "[lce-grad-in-forward]",
+        &["crates/nsl-codegen/src/stmt_train/lce_gif.rs"],
+        "how many fused LM heads compute their gradient in the forward (the backward hands on the \
+         saved x gradient, no logits recompute), and why the others keep it in the backward",
+    ),
+    m(
         "[arena]",
         &[
             // The transient-memory arena projection (section 6e of the
@@ -577,6 +583,7 @@ pub mod tokens {
     pub const PASS_BUS: &str = "[pass-bus]";
     pub const FLASH_BWD: &str = "[flash-bwd]";
     pub const TIED_EMBED: &str = "[tied-embed]";
+    pub const LCE_GRAD_IN_FORWARD: &str = "[lce-grad-in-forward]";
     pub const ARENA: &str = "[arena]";
     pub const GPU_MEM: &str = "[gpu-mem]";
     pub const GPU_LAUNCH_COUNT: &str = "[nsl-gpu-launch-count]";

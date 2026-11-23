@@ -134,6 +134,7 @@ pub mod wengert;
 pub mod wengert_lower;
 pub mod wgrad_fusion;
 pub mod tied_embed_fusion;
+pub mod lce_grad_in_forward;
 
 // --- Quantization & precision --------------------------------------------
 pub mod bitnet;
