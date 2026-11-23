@@ -1545,9 +1545,26 @@ impl Compiler<'_> {
                 // recorded, so its gradient is summed back over each group).
                 let (k_use, v_use, expanded) =
                     self.emit_sdpa_expand_kv(builder, q_val, k_val, v_val)?;
-                let out = self
-                    .compile_flash_attention_call(builder, state, q_val, k_use, v_use, scale_val)?;
-                for t in expanded {
+                // The decorated kernels read their operands' memory as
+                // contiguous `[b, h, s, d]`. The stdlib hands them head views
+                // (`x.reshape([b, s, h, d]).transpose(1, 2)` of a projection,
+                // and RoPE keeps that layout), so each operand is made
+                // contiguous first: a copy for a view (recorded on a live
+                // tape, so its gradient reaches the view), the tensor itself
+                // otherwise.
+                let mut contiguous = Vec::with_capacity(3);
+                for t in [q_val, k_use, v_use] {
+                    contiguous.push(self.compile_call_by_name(builder, "nsl_tensor_contiguous", &[t])?);
+                }
+                let out = self.compile_flash_attention_call(
+                    builder,
+                    state,
+                    contiguous[0],
+                    contiguous[1],
+                    contiguous[2],
+                    scale_val,
+                )?;
+                for t in contiguous.into_iter().chain(expanded) {
                     self.compile_call_by_name(builder, "nsl_tensor_free_transient", &[t])?;
                 }
                 return Ok(out);

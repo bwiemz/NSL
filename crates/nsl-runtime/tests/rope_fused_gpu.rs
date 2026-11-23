@@ -136,3 +136,86 @@ fn the_fused_rope_is_the_decomposed_graph_bit_for_bit() {
     let bad = got16b.iter().zip(&ref32b).filter(|(g, r)| **g != rne_bf16(**r)).count();
     assert_eq!(bad, 0, "bf16 rope adjoint: {bad} of {} values are not one RNE rounding", ref32b.len());
 }
+
+/// The strides of a tensor handle.
+fn strides(t: i64) -> Vec<i64> {
+    let h = unsafe { &*(t as *const Head) };
+    (0..h._ndim as usize).map(|i| unsafe { *h._strides.add(i) }).collect()
+}
+
+/// RoPE keeps its input's dense layout: the `[b, s, h, d]` head view of a
+/// projection comes back as the same kind of view (so the attention reads it
+/// in place, and the adjoint's result goes back into the projection's GEMMs
+/// without a transpose copy), a contiguous input as a contiguous result. In
+/// both layouts, for every head dim the vector kernel serves (a multiple of
+/// 16, so each half row is whole 8-element runs: 32, 48, 64, 128) and every
+/// storage pair, the values are the decomposed graph's bit for bit (one
+/// rounding for a bf16 result), as is the strided kernel's for a head dim it
+/// does not serve (24).
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn rope_keeps_the_head_layout_and_the_bits() {
+    assert_eq!(nsl_runtime::nsl_cuda_init(), 0);
+    let bshd_on = std::env::var("NSL_ATTN_BSHD").ok().as_deref() != Some("0");
+    for (b, h, s, d) in [(2i64, 3i64, 37i64, 64i64), (1, 5, 19, 128), (3, 2, 11, 32), (2, 3, 7, 48), (2, 2, 9, 24)] {
+        let served = d % 16 == 0;
+        let x_store = gpu_f32(&vals((b * s * h * d) as usize, 13, 1.5), &[b, s, h, d]);
+        let x = unsafe { nsl_tensor_transpose(x_store, 1, 2) };
+        let dy = gpu_f32(&vals((b * h * s * d) as usize, 17, 1e-6), &[b, h, s, d]);
+        let cos = gpu_f32(&vals((s * d) as usize, 19, 1.0), &[s, d]);
+        let sin = gpu_f32(&vals((s * d) as usize, 23, 1.0), &[s, d]);
+        let l = list(&[1, 1, s, d]);
+        let (c4, s4) = unsafe { (nsl_tensor_reshape(cos, l), nsl_tensor_reshape(sin, l)) };
+        unsafe { nsl_list_free(l) };
+        let want_f = bits(unsafe { nsl_tensor_add(nsl_tensor_mul(x, c4, 0), nsl_tensor_mul(nsl_tensor_rotate_half(x), s4, 0), 0) }, 4);
+        let want_b = bits(
+            unsafe { nsl_tensor_add(nsl_tensor_rotate_half_neg(nsl_tensor_mul(dy, s4, 0)), nsl_tensor_mul(dy, c4, 0), 0) },
+            4,
+        );
+        let bshd = [s * h * d, d, h * d, 1];
+        let contiguous = [h * s * d, s * d, d, 1];
+        for (in_dt, out_dt) in [(1i64, 1i64), (3, 3), (3, 1), (1, 3)] {
+            let tag = format!("[{b}, {h}, {s}, {d}] {in_dt}->{out_dt}");
+            let (xi, dyi) = if in_dt == 3 {
+                unsafe { (nsl_tensor_transpose(nsl_tensor_to_dtype(x_store, 3), 1, 2), nsl_tensor_to_dtype(dy, 3)) }
+            } else {
+                (x, dy)
+            };
+            // The reference for a bf16 input reads the same bf16 values.
+            let (ref_f, ref_b) = if in_dt == 3 {
+                let xw = unsafe { nsl_tensor_to_dtype(xi, 1) };
+                let dyw = unsafe { nsl_tensor_to_dtype(dyi, 1) };
+                (bits(unsafe { nsl_tensor_rope(xw, cos, sin) }, 4), bits(unsafe { nsl_tensor_rope_backward(dyw, cos, sin) }, 4))
+            } else {
+                (want_f.clone(), want_b.clone())
+            };
+            let got_f = unsafe { nsl_tensor_rope_dt(xi, cos, sin, out_dt) };
+            let got_b = unsafe { nsl_tensor_rope_backward_dt(dyi, cos, sin, out_dt) };
+            let want_layout_f = if served && bshd_on { bshd } else { contiguous };
+            assert_eq!(strides(got_f), want_layout_f, "{tag}: forward result layout");
+            assert_eq!(strides(got_b), contiguous, "{tag}: adjoint of a contiguous gradient");
+            for (what, got, want) in [("forward", got_f, &ref_f), ("adjoint", got_b, &ref_b)] {
+                let g = bits(got, if out_dt == 3 { 2 } else { 4 });
+                let bad = g
+                    .iter()
+                    .zip(want.iter())
+                    .filter(|(g, w)| if out_dt == 3 { **g != rne_bf16(**w) } else { g != w })
+                    .count();
+                assert_eq!(bad, 0, "{tag} {what}: {bad} of {} values differ", want.len());
+            }
+        }
+        // The adjoint of a [b, s, h, d] gradient (the attention backward's
+        // dQ/dK) keeps that layout, with the decomposed graph's values.
+        let dy_store = gpu_f32(&vals((b * s * h * d) as usize, 29, 1e-6), &[b, s, h, d]);
+        let dyv = unsafe { nsl_tensor_transpose(dy_store, 1, 2) };
+        let want = bits(
+            unsafe { nsl_tensor_add(nsl_tensor_rotate_half_neg(nsl_tensor_mul(dyv, s4, 0)), nsl_tensor_mul(dyv, c4, 0), 0) },
+            4,
+        );
+        let got = unsafe { nsl_tensor_rope_backward_dt(dyv, cos, sin, 1) };
+        assert_eq!(strides(got), if served && bshd_on { bshd } else { contiguous }, "[{b}, {h}, {s}, {d}]: adjoint layout");
+        let g = bits(got, 4);
+        let bad = g.iter().zip(&want).filter(|(g, w)| g != w).count();
+        assert_eq!(bad, 0, "[{b}, {h}, {s}, {d}] adjoint of a head view: {bad} of {} values differ", want.len());
+    }
+}

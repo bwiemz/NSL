@@ -96,6 +96,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "Allocate via cuMemAllocAsync (driver pool), not the caching allocator; incompatible with CUDA graphs. Measured at Coder-1B: +1.2 GiB driver peak, 0.98x tok/s."
     ),
     var!(
+        "NSL_ATTN_BSHD",
+        Bool,
+        "0 only",
+        "on (RoPE and the tensor-core attention keep the [b, s, h, d] head layout)",
+        Perf,
+        Runtime,
+        "Set to 0 to make RoPE write contiguous [b, h, s, d] and the tensor-core attention copy head views to it (same values, the previous copies)."
+    ),
+    var!(
         "NSL_AUTOTUNE_FALLBACK",
         Bool,
         "any value (set, even empty; docs say 1)",

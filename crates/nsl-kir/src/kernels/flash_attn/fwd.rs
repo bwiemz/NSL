@@ -28,7 +28,7 @@
 //! The grid's x runs over query tiles, heaviest first under causal masking,
 //! y over `batch · heads`; the launch covers the whole batch.
 
-use super::{f32_global, h2, h2_shared, io_global, G, LN_2, LOG2_E, SMEM_ROW_PAD};
+use super::{f32_global, h2, h2_shared, io_global, RowStride, G, LN_2, LOG2_E, SMEM_ROW_PAD};
 use crate::kernels::storage::Storage;
 use crate::kernel_ir::{
     AddressSpace, CmpOp, KernelIR, KirEdge, KirOp, KirTerminator, KirType, SmemLayout,
@@ -54,6 +54,12 @@ pub struct FwdConfig {
     /// over query tiles (heaviest first within each `batch · head` row only).
     /// The arithmetic of every CTA is the same either way.
     pub lpt: bool,
+    /// Q, K, V and O are stored `[batch, seq, heads, head_dim]` (the
+    /// attention layout, see [`super::bshd_head`]) instead of contiguous
+    /// `[batch, heads, seq, head_dim]`. Only addresses differ: the same
+    /// elements meet the same arithmetic. The log-sum-exp stays `[batch,
+    /// heads, seq]`.
+    pub bshd: bool,
 }
 
 impl FwdConfig {
@@ -68,7 +74,7 @@ impl FwdConfig {
     /// `tc_attention_kernel_times` in nsl-runtime's `attention_tc.rs`).
     pub fn new(head_dim: u32, causal: bool) -> FwdConfig {
         let (warps, block_n) = default_fwd_tiling(head_dim);
-        FwdConfig { head_dim, causal, warps, block_n, io: Storage::F32, lpt: false }
+        FwdConfig { head_dim, causal, warps, block_n, io: Storage::F32, lpt: false, bshd: false }
     }
 
     /// This variant with its Q/K/V/O stored as `io`.
@@ -80,6 +86,11 @@ impl FwdConfig {
     /// causal masking, where every CTA does the same work).
     pub fn with_lpt(self, on: bool) -> FwdConfig {
         FwdConfig { lpt: on && self.causal, ..self }
+    }
+
+    /// This variant with its operands in the `[b, s, h, d]` layout.
+    pub fn with_bshd(self, on: bool) -> FwdConfig {
+        FwdConfig { bshd: on, ..self }
     }
 
     pub fn block_m(&self) -> u32 {
@@ -97,13 +108,14 @@ impl FwdConfig {
     /// The `.visible .entry` name; the launcher launches by it.
     pub fn kernel_name(&self) -> String {
         format!(
-            "nsl_flash_tc_fwd_d{}_{}_w{}_n{}{}{}",
+            "nsl_flash_tc_fwd_d{}_{}_w{}_n{}{}{}{}",
             self.head_dim,
             if self.causal { "causal" } else { "full" },
             self.warps,
             self.block_n,
             if self.io == Storage::Bf16 { "_bf16" } else { "" },
-            if self.lpt { "_lpt" } else { "" }
+            if self.lpt { "_lpt" } else { "" },
+            if self.bshd { "_bshd" } else { "" }
         )
     }
 
@@ -156,10 +168,10 @@ impl TileMap {
         TileMap { chunks, row_step: threads / per_row, t_row, t_col }
     }
 
-    /// Load the tile whose first row is `row0` from `base` (a `[seq,
-    /// head_dim]` f32 matrix): rows at or past `seq` read row `seq - 1`'s
-    /// address and are replaced by zeros. Returns `chunks · 4` values,
-    /// optionally each multiplied by `scale`.
+    /// Load the tile whose first row is `row0` from `base` (a head's `seq`
+    /// rows of `head_dim` elements, `rs` apart): rows at or past `seq` read
+    /// row `seq - 1`'s address and are replaced by zeros. Returns `chunks ·
+    /// 4` values, optionally each multiplied by `scale`.
     #[allow(clippy::too_many_arguments)] // the tile's geometry, spelled out at each call
     pub fn load(
         &self,
@@ -168,7 +180,7 @@ impl TileMap {
         row0: VarId,
         seq: VarId,
         seq_m1: VarId,
-        head_dim: u32,
+        rs: RowStride,
         scale: Option<VarId>,
     ) -> Vec<VarId> {
         let mut out = Vec::with_capacity(self.chunks as usize * 4);
@@ -178,7 +190,7 @@ impl TileMap {
             let row = g.add_u32c(r, i * self.row_step);
             let valid = g.cmp(row, seq, CmpOp::Lt);
             let rc = g.min(row, seq_m1);
-            let off = g.mul_u32c(rc, head_dim);
+            let off = rs.off(g, rc);
             let off = g.add(off, self.t_col);
             let p = g.ptr(base, off);
             let vals = g.load_vec_f32(p, 4, AddressSpace::Global);
@@ -275,9 +287,10 @@ impl Lane {
 }
 
 /// Load `rows` (a lane's `lo` and `hi` accumulator rows, already clamped
-/// into the tensor) of a `[seq, head_dim]` f32 matrix at `base` as m16k16
-/// A fragments, one per k-step of 16 columns, each value multiplied by
-/// `scale` when given.
+/// into the tensor) of a head's `[seq, head_dim]` rows at `base`, `rs`
+/// apart, as m16k16 A fragments, one per k-step of 16 columns, each value
+/// multiplied by `scale` when given.
+#[allow(clippy::too_many_arguments)] // the fragment's geometry, spelled out at each call
 pub(crate) fn load_a_frags(
     g: &mut G,
     base: VarId,
@@ -285,10 +298,11 @@ pub(crate) fn load_a_frags(
     row_hi: VarId,
     lc: VarId,
     head_dim: u32,
+    rs: RowStride,
     scale: Option<(VarId, VarId)>,
 ) -> Vec<[VarId; 4]> {
-    let lo_off = g.mul_u32c(row_lo, head_dim);
-    let hi_off = g.mul_u32c(row_hi, head_dim);
+    let lo_off = rs.off(g, row_lo);
+    let hi_off = rs.off(g, row_hi);
     let c2 = g.mul_u32c(lc, 2);
     let lo_off = g.add(lo_off, c2);
     let hi_off = g.add(hi_off, c2);
@@ -443,8 +457,15 @@ pub fn build(cfg: FwdConfig) -> KernelIR {
     let head_elems = g.mul(seq64, hd64);
     let bh64 = g.cast(bh, U64);
     let kvbh64 = g.cast(kv_bh, U64);
-    let q_off = g.mul(bh64, head_elems);
-    let kv_off = g.mul(kvbh64, head_elems);
+    let (q_off, kv_off, q_rs, kv_rs) = if cfg.bshd {
+        let (qo, qrs) = super::bshd_head(&mut g, b_idx, h, heads, seq64, hd);
+        let (ko, krs) = super::bshd_head(&mut g, b_idx, kvh, kv_heads, seq64, hd);
+        (qo, ko, qrs, krs)
+    } else {
+        let qo = g.mul(bh64, head_elems);
+        let ko = g.mul(kvbh64, head_elems);
+        (qo, ko, RowStride::Const(hd), RowStride::Const(hd))
+    };
     let q_base = g.ptr(q, q_off);
     let o_base = g.ptr(o, q_off);
     let k_base = g.ptr(k, kv_off);
@@ -469,7 +490,7 @@ pub fn build(cfg: FwdConfig) -> KernelIR {
     };
 
     // Q as A fragments for the whole kernel.
-    let qa = load_a_frags(&mut g, q_base, r_lo_c, r_hi_c, ln.lc, hd, None);
+    let qa = load_a_frags(&mut g, q_base, r_lo_c, r_hi_c, ln.lc, hd, q_rs, None);
 
     // KV tile count.
     let kv_end = if cfg.causal {
@@ -501,8 +522,8 @@ pub fn build(cfg: FwdConfig) -> KernelIR {
 
     // Prologue: tile 0 in flight.
     let zero_u = g.u32c(0);
-    let pf_k0 = tm.load(&mut g, k_base, zero_u, seq, seq_m1, hd, None);
-    let pf_v0 = tm.load(&mut g, v_base, zero_u, seq, seq_m1, hd, None);
+    let pf_k0 = tm.load(&mut g, k_base, zero_u, seq, seq_m1, kv_rs, None);
+    let pf_v0 = tm.load(&mut g, v_base, zero_u, seq, seq_m1, kv_rs, None);
 
     // header(j, o[n_dn][4], m_lo, m_hi, l_lo, l_hi, pf_k[..], pf_v[..])
     let header = g.b.new_block();
@@ -545,8 +566,8 @@ pub fn build(cfg: FwdConfig) -> KernelIR {
     let j1 = g.add(j, one);
     let jn = g.min(j1, n_kv_m1);
     let kvn = g.mul_u32c(jn, bn);
-    let nk = tm.load(&mut g, k_base, kvn, seq, seq_m1, hd, None);
-    let nv = tm.load(&mut g, v_base, kvn, seq, seq_m1, hd, None);
+    let nk = tm.load(&mut g, k_base, kvn, seq, seq_m1, kv_rs, None);
+    let nv = tm.load(&mut g, v_base, kvn, seq, seq_m1, kv_rs, None);
     let kv0 = g.mul_u32c(j, bn);
 
     let flat_o: Vec<VarId> = o_acc.iter().flatten().copied().collect();
@@ -608,7 +629,7 @@ pub fn build(cfg: FwdConfig) -> KernelIR {
 
     // ── exit: normalise and store ──
     g.b.set_block(exit);
-    epilogue(&mut g, &o_acc, [m_lo, m_hi], [l_lo, l_hi], [r_lo, r_hi], seq, sl2, o_base, lse_base, ln.lc, hd);
+    epilogue(&mut g, &o_acc, [m_lo, m_hi], [l_lo, l_hi], [r_lo, r_hi], seq, sl2, o_base, lse_base, ln.lc, q_rs);
     g.b.terminate(KirTerminator::Return);
     g.b.finalize()
 }
@@ -723,7 +744,7 @@ fn epilogue(
     o_base: VarId,
     lse_base: VarId,
     lc: VarId,
-    hd: u32,
+    rs: RowStride,
 ) {
     let one_f = g.f32c(1.0);
     let ln2 = g.f32c(LN_2);
@@ -735,7 +756,7 @@ fn epilogue(
         let inv = g.div(one_f, lt);
         let row = rows[half];
         let valid = g.cmp(row, seq, CmpOp::Lt);
-        let roff = g.mul_u32c(row, hd);
+        let roff = rs.off(g, row);
         let roff = g.add(roff, c2);
         let prow = g.ptr(o_base, roff);
         for (n, acc) in o_acc.iter().enumerate() {
@@ -786,9 +807,12 @@ mod tests {
     #[test]
     fn every_variant_verifies_and_lowers_to_tensor_core_ops() {
         for hd in FwdConfig::HEAD_DIMS {
-            for (causal, lpt) in [(false, false), (true, false), (true, true)] {
-                let cfg = FwdConfig::new(hd, causal).with_lpt(lpt);
-                assert_eq!(cfg.kernel_name().ends_with("_lpt"), lpt);
+            for (causal, lpt, bshd) in
+                [(false, false, false), (true, false, false), (true, true, false), (false, false, true), (true, true, true)]
+            {
+                let cfg = FwdConfig::new(hd, causal).with_lpt(lpt).with_bshd(bshd);
+                assert_eq!(cfg.kernel_name().contains("_lpt"), lpt);
+                assert_eq!(cfg.kernel_name().ends_with("_bshd"), bshd);
                 let ir = build(cfg);
                 assert_eq!(ir.verify(), Ok(()), "{}", cfg.kernel_name());
                 let text = String::from_utf8(ptx(cfg)).unwrap();

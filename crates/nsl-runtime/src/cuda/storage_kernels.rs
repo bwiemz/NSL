@@ -31,6 +31,7 @@ enum Kernel {
     RotateHalf(RotateHalfOp, Storage, Storage),
     Norm(NormOp, Storage, Storage),
     Rope(nsl_kir::kernels::rope::RopeDir, Storage, Storage),
+    RopeRows(nsl_kir::kernels::rope::RopeDir, Storage, Storage),
     Swiglu(nsl_kir::kernels::swiglu::SwigluKernel),
 }
 
@@ -50,6 +51,7 @@ fn module(k: Kernel) -> (&'static str, &'static str) {
             Kernel::RotateHalf(op, i, out) => ew::build_rotate_half_st(op, i, out),
             Kernel::Norm(op, i, out) => nsl_kir::kernels::norm::build_st(op, i, out),
             Kernel::Rope(dir, i, out) => nsl_kir::kernels::rope::build(dir, i, out),
+            Kernel::RopeRows(dir, i, out) => nsl_kir::kernels::rope::build_rows(dir, i, out),
             Kernel::Swiglu(k) => k.build(),
         };
         let name: &'static str = Box::leak(format!("{}\0", ir.name).into_boxed_str());
@@ -195,6 +197,47 @@ pub(crate) fn rope(dir: nsl_kir::kernels::rope::RopeDir, x: i64, cos: i64, sin: 
         &mut [data(x), data(cos), data(sin), data(c), n as u64, dim(3), dim(2), dim(1), st(0), st(1), st(2), st(3)],
     );
     c
+}
+
+/// The dense-rows RoPE (`nsl_kir::kernels::rope::build_rows`): `x` `[b, h,
+/// s, d]` f32 or bf16 densely stored in `layout` (`crate::attn_layout`),
+/// `cos`/`sin` contiguous f32 `[s, d]`, the result `[b, h, s, d]` in the same
+/// layout, stored as `out`. The caller has checked `d % 16 == 0`, fewer than
+/// 2^31 elements and 16-byte aligned operands ([`rope_rows_fits`]).
+pub(crate) fn rope_rows(
+    dir: nsl_kir::kernels::rope::RopeDir,
+    x: i64,
+    cos: i64,
+    sin: i64,
+    out: Storage,
+    layout: crate::attn_layout::HeadLayout,
+) -> i64 {
+    super::inner::set_oom_context("rope");
+    let tx = NslTensor::from_ptr_ref(x);
+    let dims: [i64; 4] = std::array::from_fn(|i| unsafe { *tx.shape.add(i) });
+    let n = tx.len as usize;
+    let data_out = super::inner::alloc_managed(n * out.bytes());
+    let c = crate::attn_layout::wrap_head_tensor(data_out, dims, layout, dtype_of(out), tx.device);
+    let pos_div = match layout {
+        crate::attn_layout::HeadLayout::Bhsd => 1,
+        crate::attn_layout::HeadLayout::Bshd => dims[1] as u64,
+    };
+    let pairs = u64::from(nsl_kir::kernels::rope::ROWS_PAIRS);
+    let chunks = n as u64 / (2 * pairs);
+    let k = Kernel::RopeRows(dir, storage_of(tx), out);
+    launch(k, chunks as usize, &mut [data(x), data(cos), data(sin), data(c), chunks, dims[3] as u64, dims[2] as u64, pos_div]);
+    c
+}
+
+/// Whether [`rope_rows`] serves `x` (dense in `layout`, already checked by
+/// the caller) with these tables: each half of a row splits into runs of
+/// `ROWS_PAIRS` elements (`d` a multiple of 16) and every operand is 16-byte
+/// aligned (the kernel's vector accesses; a run starts a multiple of 16
+/// bytes into its row for either storage).
+pub(crate) fn rope_rows_fits(x: &NslTensor, cos: &NslTensor, sin: &NslTensor) -> bool {
+    let d = unsafe { *x.shape.add(3) } as u64;
+    let pairs = 2 * u64::from(nsl_kir::kernels::rope::ROWS_PAIRS);
+    d.is_multiple_of(pairs) && [x, cos, sin].iter().all(|t| (t.data as u64).is_multiple_of(16))
 }
 
 /// The fused SwiGLU kernels' elements per thread (`nsl_kir::kernels::swiglu`):

@@ -70,7 +70,12 @@ model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_di
         let k = x @ self.wk
         let v = x @ self.wv
 
-        # Reshape to [batch, seq, heads, head_dim] then transpose to [batch, heads, seq, head_dim]
+        # The [batch, heads, seq, head_dim] head views of the projections.
+        # These are views, not copies: the memory stays [batch, seq, heads,
+        # head_dim], the layout the tensor-core attention reads and writes,
+        # and RoPE keeps it (nsl-runtime `attn_layout`). So Q, K and V reach
+        # the attention, and its output and gradients come back, with no
+        # transpose copy; the transposes here and below only relabel axes.
         let q4 = q.reshape([batch, seq_len, nh, hd]).transpose(1, 2)
         let k4 = k.reshape([batch, seq_len, nkv, hd]).transpose(1, 2)
         let v4 = v.reshape([batch, seq_len, nkv, hd]).transpose(1, 2)
@@ -83,18 +88,16 @@ model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_di
         # by `nh / nkv` query heads (query head h reads key/value head
         # h / (nh / nkv)). The tensor-core kernels read them in place and sum
         # dK/dV over each group; every other path expands them itself (see
-        # nsl-runtime `sdpa_gqa`). The fused kernels read their operands
-        # row-major, so V's head view is copied once (a quarter of the
-        # expanded copy at 4 query heads per key/value head); RoPE already
-        # writes K row-major.
-        let v_c = v4.contiguous()
-
+        # nsl-runtime `sdpa_gqa`), and a path that needs contiguous operands
+        # copies the views itself.
+        #
         # Fused attention: uses FlashAttention when on GPU, naive when on CPU.
         # Output shape: [batch, heads, seq, head_dim]
         let scale = 1.0 / sqrt(float(hd))
-        let attn_out = scaled_dot_product_attention(q_rope, k_rope, v_c, scale, true)
+        let attn_out = scaled_dot_product_attention(q_rope, k_rope, v4, scale, true)
 
-        # Reshape back: [batch, heads, seq, head_dim] -> [batch, seq, n_heads * head_dim]
+        # Back to [batch, seq, n_heads * head_dim]: a view of the tensor-core
+        # attention's output (a copy of any other path's).
         let attn_t = attn_out.transpose(1, 2)
         let attn_flat = attn_t.reshape([batch, seq_len, nh * hd])
 

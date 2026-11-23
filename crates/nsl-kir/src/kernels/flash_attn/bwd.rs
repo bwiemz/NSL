@@ -41,8 +41,8 @@
 
 use super::fwd::{acc_to_a_frags, load_a_frags, mma_b_rows, mma_b_trans, Lane, TileMap};
 use super::{
-    f32_global, f32_shared, grad_scale_from_max_bits, h2, h2_shared, io_global, u32_global, G, F16_MAX,
-    LOG2_E, SMEM_ROW_PAD,
+    f32_global, f32_shared, grad_scale_from_max_bits, h2, h2_shared, io_global, u32_global, RowStride, G,
+    F16_MAX, LOG2_E, SMEM_ROW_PAD,
 };
 use crate::kernels::storage::Storage;
 use crate::kernel_ir::{
@@ -67,6 +67,10 @@ pub struct BwdConfig {
     /// Heaviest-first grid order for the dQ and dK/dV kernels (causal only;
     /// see [`super::fwd::FwdConfig::lpt`] and [`super::grid_order`]).
     pub lpt: bool,
+    /// Q, K, V, O, dO, dQ, dK and dV in the `[batch, seq, heads, head_dim]`
+    /// layout (see [`super::fwd::FwdConfig::bshd`]); `lse`, `D` and `gmax`
+    /// keep theirs. The pre-pass then takes `heads` too.
+    pub bshd: bool,
 }
 
 /// Warps per CTA of the pre-pass, and rows each warp reduces.
@@ -86,7 +90,17 @@ impl BwdConfig {
         // 0.60 ms and dK/dV 0.76 ms at 8 warps x 32.
         let (dq_warps, dq_block_n, dkdv_warps, dkdv_block_q) =
             if head_dim > 64 { (8, 32, 8, 32) } else { (4, 32, 4, 32) };
-        BwdConfig { head_dim, causal, dq_warps, dq_block_n, dkdv_warps, dkdv_block_q, io: Storage::F32, lpt: false }
+        BwdConfig {
+            head_dim,
+            causal,
+            dq_warps,
+            dq_block_n,
+            dkdv_warps,
+            dkdv_block_q,
+            io: Storage::F32,
+            lpt: false,
+            bshd: false,
+        }
     }
 
     pub fn supported(head_dim: u32) -> bool {
@@ -108,12 +122,21 @@ impl BwdConfig {
         BwdConfig { lpt: on && self.causal, ..self }
     }
 
+    /// This variant with its operands in the `[b, s, h, d]` layout.
+    pub fn with_bshd(self, on: bool) -> BwdConfig {
+        BwdConfig { bshd: on, ..self }
+    }
+
     fn io_suffix(&self) -> &'static str {
         if self.io == Storage::Bf16 { "_bf16" } else { "" }
     }
 
     fn lpt_suffix(&self) -> &'static str {
         if self.lpt { "_lpt" } else { "" }
+    }
+
+    fn bshd_suffix(&self) -> &'static str {
+        if self.bshd { "_bshd" } else { "" }
     }
 
     /// The same problem with the pre-pass's (tiling-independent) identity.
@@ -128,7 +151,7 @@ impl BwdConfig {
     // ── pre-pass ──
 
     pub fn pre_kernel_name(&self) -> String {
-        format!("nsl_flash_tc_bwd_pre_d{}{}", self.head_dim, self.io_suffix())
+        format!("nsl_flash_tc_bwd_pre_d{}{}{}", self.head_dim, self.io_suffix(), self.bshd_suffix())
     }
 
     pub fn pre_threads(&self) -> u32 {
@@ -141,7 +164,8 @@ impl BwdConfig {
     }
 
     /// `dout, out` f32, `dvec` f32 `[rows]`, `gmax` u32 `[batch · heads]`
-    /// (zeroed by the caller), `rows`, `seq` u32.
+    /// (zeroed by the caller), `rows`, `seq` u32; the `bshd` variant takes
+    /// `heads` (u32) last.
     pub fn pre_param_names() -> [&'static str; 6] {
         ["dout", "out", "dvec", "gmax", "rows", "seq"]
     }
@@ -150,12 +174,13 @@ impl BwdConfig {
 
     pub fn dq_kernel_name(&self) -> String {
         format!(
-            "nsl_flash_tc_bwd_dq_{}_w{}_n{}{}{}",
+            "nsl_flash_tc_bwd_dq_{}_w{}_n{}{}{}{}",
             self.tag(),
             self.dq_warps,
             self.dq_block_n,
             self.io_suffix(),
-            self.lpt_suffix()
+            self.lpt_suffix(),
+            self.bshd_suffix()
         )
     }
 
@@ -185,12 +210,13 @@ impl BwdConfig {
 
     pub fn dkdv_kernel_name(&self) -> String {
         format!(
-            "nsl_flash_tc_bwd_dkdv_{}_w{}_q{}{}{}",
+            "nsl_flash_tc_bwd_dkdv_{}_w{}_q{}{}{}{}",
             self.tag(),
             self.dkdv_warps,
             self.dkdv_block_q,
             self.io_suffix(),
-            self.lpt_suffix()
+            self.lpt_suffix(),
+            self.bshd_suffix()
         )
     }
 
@@ -238,6 +264,7 @@ pub fn build_pre(cfg: BwdConfig) -> KernelIR {
     let gmax = g.b.add_param(names[3], u32_global(), AddressSpace::Global);
     let rows = g.b.add_param(names[4], U32, AddressSpace::Local);
     let seq = g.b.add_param(names[5], U32, AddressSpace::Local);
+    let heads = cfg.bshd.then(|| g.b.add_param("heads", U32, AddressSpace::Local));
     g.b.set_workgroup_size([cfg.pre_threads(), 1, 1]);
     g.b.set_launch_bounds(cfg.pre_threads(), None);
     let entry = g.b.new_block();
@@ -263,8 +290,24 @@ pub fn build_pre(cfg: BwdConfig) -> KernelIR {
         let row = g.add_u32c(wfirst, i);
         let valid = g.cmp(row, rows, CmpOp::Lt);
         let rc = g.min(row, rows_m1);
+        // Row rc is (batch·head, position) = (rc / seq, rc % seq) in `D`'s
+        // order; its dO / O row in memory is rc itself (contiguous) or
+        // (b · seq + s) · heads + h ([b, s, h, d]).
+        let mem_row = match heads {
+            None => rc,
+            Some(heads) => {
+                let bh = g.div(rc, seq);
+                let pos = g.rem(rc, seq);
+                let bi = g.div(bh, heads);
+                let hh = g.rem(bh, heads);
+                let bs = g.mul(bi, seq);
+                let bs = g.add(bs, pos);
+                let r = g.mul(bs, heads);
+                g.add(r, hh)
+            }
+        };
         let off = {
-            let r64 = g.cast(rc, KirType::U64);
+            let r64 = g.cast(mem_row, KirType::U64);
             let hd64 = g.u64c(hd as u64);
             let ro = g.mul(r64, hd64);
             let lo = g.cast(lane_off, KirType::U64);
@@ -373,8 +416,15 @@ pub fn build_dq(cfg: BwdConfig) -> KernelIR {
     let head_elems = g.mul(seq64, hd64);
     let bh64 = g.cast(bh, U64);
     let kvbh64 = g.cast(kv_bh, U64);
-    let q_off = g.mul(bh64, head_elems);
-    let kv_off = g.mul(kvbh64, head_elems);
+    let (q_off, kv_off, q_rs, kv_rs) = if cfg.bshd {
+        let (qo, qrs) = super::bshd_head(&mut g, b_idx, h, heads, seq64, hd);
+        let (ko, krs) = super::bshd_head(&mut g, b_idx, kvh, kv_heads, seq64, hd);
+        (qo, ko, qrs, krs)
+    } else {
+        let qo = g.mul(bh64, head_elems);
+        let ko = g.mul(kvbh64, head_elems);
+        (qo, ko, RowStride::Const(hd), RowStride::Const(hd))
+    };
     let row_off = g.mul(bh64, seq64);
     let q_base = g.ptr(q, q_off);
     let do_base = g.ptr(dout, q_off);
@@ -398,11 +448,11 @@ pub fn build_dq(cfg: BwdConfig) -> KernelIR {
 
     let l2e = g.f32c(LOG2_E);
     let sl2 = g.mul(scale, l2e);
-    let qa = load_a_frags(&mut g, q_base, r_lo_c, r_hi_c, ln.lc, hd, None);
+    let qa = load_a_frags(&mut g, q_base, r_lo_c, r_hi_c, ln.lc, hd, q_rs, None);
 
     // dO rows: raw values, then the per-row prescale, then fragments.
     let (doa, gs, ginv) = {
-        let raw = load_raw_rows(&mut g, do_base, r_lo_c, r_hi_c, ln.lc, hd);
+        let raw = load_raw_rows(&mut g, do_base, r_lo_c, r_hi_c, ln.lc, hd, q_rs);
         let mut gs = [0; 2];
         let mut ginv = [0; 2];
         for half in 0..2 {
@@ -472,8 +522,8 @@ pub fn build_dq(cfg: BwdConfig) -> KernelIR {
     let warp_last_row = g.add_u32c(wrow0, 15);
 
     let zero_u = g.u32c(0);
-    let pf_k0 = tm.load(&mut g, k_base, zero_u, seq, seq_m1, hd, None);
-    let pf_v0 = tm.load(&mut g, v_base, zero_u, seq, seq_m1, hd, None);
+    let pf_k0 = tm.load(&mut g, k_base, zero_u, seq, seq_m1, kv_rs, None);
+    let pf_v0 = tm.load(&mut g, v_base, zero_u, seq, seq_m1, kv_rs, None);
 
     let header = g.b.new_block();
     let body = g.b.new_block();
@@ -509,8 +559,8 @@ pub fn build_dq(cfg: BwdConfig) -> KernelIR {
     let j1 = g.add(j, one);
     let jn = g.min(j1, n_kv_m1);
     let kvn = g.mul_u32c(jn, bn);
-    let nk = tm.load(&mut g, k_base, kvn, seq, seq_m1, hd, None);
-    let nv = tm.load(&mut g, v_base, kvn, seq, seq_m1, hd, None);
+    let nk = tm.load(&mut g, k_base, kvn, seq, seq_m1, kv_rs, None);
+    let nv = tm.load(&mut g, v_base, kvn, seq, seq_m1, kv_rs, None);
     let kv0 = g.mul_u32c(j, bn);
     let flat: Vec<VarId> = dq_acc.iter().flatten().copied().collect();
     let next_args = |acc: &[VarId]| -> Vec<VarId> {
@@ -585,7 +635,7 @@ pub fn build_dq(cfg: BwdConfig) -> KernelIR {
     for half in 0..2 {
         let f = g.mul(scale, ginv[half]);
         let valid = g.cmp(rows[half], seq, CmpOp::Lt);
-        let roff = g.mul_u32c(rows[half], hd);
+        let roff = q_rs.off(&mut g, rows[half]);
         let roff = g.add(roff, c2);
         let prow = g.ptr(dq_base, roff);
         for (n, acc) in dq_acc.iter().enumerate() {
@@ -600,9 +650,9 @@ pub fn build_dq(cfg: BwdConfig) -> KernelIR {
     g.b.finalize()
 }
 
-/// The raw f32 values a lane holds of rows `lo`/`hi` in m16k16 A-fragment
-/// order: per k-step, registers 0..4 as `(x, x+1)` pairs (`[lo c, hi c, lo
-/// c+8, hi c+8]`).
+/// The raw f32 values a lane holds of rows `lo`/`hi` (`rs` apart) in m16k16
+/// A-fragment order: per k-step, registers 0..4 as `(x, x+1)` pairs (`[lo
+/// c, hi c, lo c+8, hi c+8]`).
 fn load_raw_rows(
     g: &mut G,
     base: VarId,
@@ -610,9 +660,10 @@ fn load_raw_rows(
     row_hi: VarId,
     lc: VarId,
     head_dim: u32,
+    rs: RowStride,
 ) -> Vec<[(VarId, VarId); 4]> {
-    let lo_off = g.mul_u32c(row_lo, head_dim);
-    let hi_off = g.mul_u32c(row_hi, head_dim);
+    let lo_off = rs.off(g, row_lo);
+    let hi_off = rs.off(g, row_hi);
     let c2 = g.mul_u32c(lc, 2);
     let lo_off = g.add(lo_off, c2);
     let hi_off = g.add(hi_off, c2);
@@ -759,7 +810,21 @@ pub fn build_dkdv(cfg: BwdConfig) -> KernelIR {
     let hd64 = g.u64c(hd as u64);
     let head_elems = g.mul(seq64, hd64);
     let bkv64 = g.cast(bkv, U64);
-    let kv_off = g.mul(bkv64, head_elems);
+    // [b, s, h, d]: this kv head's base and stride, and the batch's first
+    // query row (`b · seq · heads`) and the query row stride.
+    let (kv_off, kv_rs, q_lay) = if cfg.bshd {
+        let (ko, krs) = super::bshd_head(&mut g, b_idx, kvh, kv_heads, seq64, hd);
+        let b64 = g.cast(b_idx, U64);
+        let heads64 = g.cast(heads, U64);
+        let bs = g.mul(b64, seq64);
+        let bsh = g.mul(bs, heads64);
+        let h_first = g.mul(kvh, group);
+        let qrs = g.mul_u32c(heads, hd);
+        (ko, krs, Some((bsh, h_first, RowStride::Var(qrs))))
+    } else {
+        (g.mul(bkv64, head_elems), RowStride::Const(hd), None)
+    };
+    let q_rs = q_lay.map_or(RowStride::Const(hd), |l| l.2);
     let k_base = g.ptr(k, kv_off);
     let v_base = g.ptr(v, kv_off);
     let dk_base = g.ptr(dk, kv_off);
@@ -792,9 +857,9 @@ pub fn build_dkdv(cfg: BwdConfig) -> KernelIR {
     // Stage this CTA's K and V tiles once.
     {
         let tm_kv = TileMap::new(&mut g, tid, hd, bn, threads);
-        let kv_vals = tm_kv.load(&mut g, k_base, k0, seq, seq_m1, hd, None);
+        let kv_vals = tm_kv.load(&mut g, k_base, k0, seq, seq_m1, kv_rs, None);
         tm_kv.store(&mut g, k_s, &kv_vals, rw);
-        let vv = tm_kv.load(&mut g, v_base, k0, seq, seq_m1, hd, None);
+        let vv = tm_kv.load(&mut g, v_base, k0, seq, seq_m1, kv_rs, None);
         tm_kv.store(&mut g, v_s, &vv, rw);
     }
 
@@ -857,11 +922,21 @@ pub fn build_dkdv(cfg: BwdConfig) -> KernelIR {
         let q0 = g.mul_u32c(qt, bq);
         let bhq = g.add(bh_first, gi);
         let bhq64 = g.cast(bhq, U64);
-        let off = g.mul(bhq64, head_elems);
+        let off = match q_lay {
+            None => g.mul(bhq64, head_elems),
+            Some((bsh, h_first, _)) => {
+                // ((b · seq) · heads + h) · head_dim, h = h_first + gi.
+                let hq = g.add(h_first, gi);
+                let hq64 = g.cast(hq, U64);
+                let r = g.add(bsh, hq64);
+                let hd64 = g.u64c(hd as u64);
+                g.mul(r, hd64)
+            }
+        };
         let qb = g.ptr(q, off);
         let db = g.ptr(dout, off);
-        let qv = tm.load(g, qb, q0, seq, seq_m1, hd, None);
-        let dov = tm.load(g, db, q0, seq, seq_m1, hd, Some(gs));
+        let qv = tm.load(g, qb, q0, seq, seq_m1, q_rs, None);
+        let dov = tm.load(g, db, q0, seq, seq_m1, q_rs, Some(gs));
         // lse and D of row q0 + tid (threads below bq).
         let row = g.add(q0, tid_c);
         let valid = g.cmp(row, seq, CmpOp::Lt);
@@ -1027,7 +1102,7 @@ pub fn build_dkdv(cfg: BwdConfig) -> KernelIR {
     let fk = g.mul(scale, ginv);
     for (half, &key) in [key_lo, key_hi].iter().enumerate() {
         let valid = g.cmp(key, seq, CmpOp::Lt);
-        let roff = g.mul_u32c(key, hd);
+        let roff = kv_rs.off(&mut g, key);
         let roff = g.add(roff, c2);
         let pk = g.ptr(dk_base, roff);
         let pv = g.ptr(dv_base, roff);
@@ -1077,11 +1152,16 @@ mod tests {
     #[test]
     fn every_backward_variant_verifies_and_lowers() {
         for hd in BwdConfig::HEAD_DIMS {
-            for (causal, lpt) in [(false, false), (true, false), (true, true)] {
-                let cfg = BwdConfig::new(hd, causal).with_lpt(lpt);
+            for (causal, lpt, bshd) in
+                [(false, false, false), (true, false, false), (true, true, false), (false, false, true), (true, true, true)]
+            {
+                let cfg = BwdConfig::new(hd, causal).with_lpt(lpt).with_bshd(bshd);
                 assert_eq!(cfg.lpt, lpt);
-                assert_eq!(cfg.dkdv_kernel_name().ends_with("_lpt"), lpt);
-                assert_eq!(cfg.dq_kernel_name().ends_with("_lpt"), lpt);
+                assert_eq!(cfg.dkdv_kernel_name().contains("_lpt"), lpt);
+                assert_eq!(cfg.dq_kernel_name().contains("_lpt"), lpt);
+                for name in [cfg.pre_kernel_name(), cfg.dq_kernel_name(), cfg.dkdv_kernel_name()] {
+                    assert_eq!(name.ends_with("_bshd"), bshd, "{name}");
+                }
                 for (name, ir) in [
                     (cfg.pre_kernel_name(), build_pre(cfg)),
                     (cfg.dq_kernel_name(), build_dq(cfg)),
