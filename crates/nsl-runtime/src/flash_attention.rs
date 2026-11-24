@@ -36,8 +36,11 @@ static SDPA_FUSED_LAUNCH_COUNTS: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
-/// How many device-side flash BACKWARD calls were routed to the deterministic
-/// CPU reference instead of the atomicAdd phase-2 kernel.
+/// How many device-side flash BACKWARD calls took a deterministic route: under
+/// `--deterministic` the tensor-core kernels (one writer per output, no
+/// atomics) where they apply, otherwise, and always with
+/// `NSL_FLASH_BWD_CPU=1`, the CPU reference instead of the atomicAdd phase-2
+/// kernel.
 ///
 /// Always live (one relaxed increment per backward). A determinism gate that
 /// only diffs two loss streams passes just as well when the routing it means to
@@ -1046,7 +1049,8 @@ fn refuse_bf16_attention(which: &str) -> ! {
             "the attention {which} has bf16 operands (precision=\"bf16\") but cannot run on the \
              tensor-core kernels, the only attention path that reads bf16: they need head_dim 64 or \
              128, an unpacked batch (no segment ids), sm_80 or newer, NSL_TC_ATTENTION not set to 0, \
-             and (backward) the forward's saved log-sum-exp. Train this model with precision=\"f32\""
+             and (backward) NSL_FLASH_BWD_CPU not set to 1 and the forward's saved log-sum-exp. Train \
+             this model with precision=\"f32\""
         ),
     )
 }
@@ -7988,28 +7992,20 @@ pub extern "C" fn nsl_flash_attention_backward(
         // (The toy gate had a second, independent problem: its fixture is
         // attention-free by design, so it never ran this kernel at all.)
         //
-        // COST: this routes the whole flash backward to the host reference,
-        // which is slow (nsys once put the CPU GQA backward at ~50% of process
-        // CPU time at the 16M base config). That is the same trade M46 already
-        // makes elsewhere — its deterministic sum/mean kernels are sequential
-        // single-thread PTX. Correctness first.
-        //
-        // THE STANDING FIX IS A dQ PASS, and it is NOT what an earlier draft of
-        // this comment claimed. "Own each dK/dV tile with one block and loop the
-        // query blocks" is already precisely what phase 2 does, so implementing
-        // it changes nothing and leaves the dQ atomic untouched. What is needed
-        // is to remove the cross-CTA reduction on dQ: either accumulate dQ into
-        // per-KV-tile scratch and reduce it in a fixed order, or add a second
-        // pass with the parallelization transposed (own each Q tile, loop the KV
-        // tiles) so each dQ row has exactly one writer — the standard FA-2
-        // split-kernel shape. Either is a PTX project, not a routing change.
-        // NSL_FLASH_BWD_CPU is tri-state, because the routing is correct by
-        // default but expensive (~36x/step at Coder-50M; ~18x whole-program on
-        // pretrain_cert -- see DETERMINISM_M46_2026_08_22.md EC4), and several existing
-        // GPU gates pass `--deterministic` for reasons that have nothing to do
-        // with the attention backward. Without a valve those all pay the cost.
-        //   unset  -> `--deterministic` decides
-        //   "1"    -> force the CPU reference even without the flag
+        // THE STANDING FIX IS A dQ PASS with one writer per dQ row, and the
+        // tensor-core kernels (`attention_tc`, head_dim 64 / 128, unpacked) are
+        // exactly that: a dQ kernel owning each query tile, a dK/dV kernel owning
+        // each key tile, no atomics. So since 2026-11-24 `--deterministic` takes
+        // them wherever they apply (`det_tc_ok` below), and only the phase-2
+        // kernels' shapes go to the host reference, which is slow (nsys once put
+        // the CPU GQA backward at ~50% of process CPU time at the 16M base
+        // config; ~36x/step at Coder-50M).
+        // NSL_FLASH_BWD_CPU is tri-state, because the host routing is correct but
+        // expensive (~18x whole-program on pretrain_cert -- see
+        // DETERMINISM_M46_2026_08_22.md EC4), and gates that pass `--deterministic`
+        // for reasons unrelated to the attention backward used to pay it.
+        //   unset  -> `--deterministic` decides (tensor-core kernels, else host)
+        //   "1"    -> force the CPU reference everywhere, even without the flag
         //   "0"    -> OPT OUT of the deterministic routing, loudly
         // The opt-out is deliberately noisy on stderr rather than silent: it
         // gives back exactly the guarantee the flag advertises, so a run that
@@ -8031,23 +8027,13 @@ pub extern "C" fn nsl_flash_attention_backward(
         }
         let force_cpu_bwd = !opted_out
             && (deterministic_mode || bwd_cpu_env.as_deref() == Some("1"));
-        if force_cpu_bwd && dout_t.device > 0 {
-            // Counted, not just logged: a gate needs to prove the deterministic
-            // route was actually TAKEN. A determinism test that only compares
-            // two loss streams passes just as well when the kernel it means to
-            // exercise never ran.
-            FLASH_BWD_DET_ROUTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if flash_debug {
-                let why = if deterministic_mode {
-                    "--deterministic"
-                } else {
-                    "NSL_FLASH_BWD_CPU=1"
-                };
-                crate::nsl_log!(INFO, "flash-bwd", 
-                    "[flash-bwd] {why} — deterministic CPU reference backward forced"
-                );
-            }
-        }
+        // `--deterministic` alone does not need the host: the tensor-core
+        // kernels below give every dQ, dK and dV element one writer and no
+        // atomics, so they are bit-reproducible run to run, and a deterministic
+        // run takes them wherever they apply. Only the phase-2 kernels (packed
+        // batches, other head dims, `NSL_TC_ATTENTION=0`) still go to the CPU
+        // reference. `NSL_FLASH_BWD_CPU=1` forces the host everywhere.
+        let det_tc_ok = force_cpu_bwd && deterministic_mode && bwd_cpu_env.as_deref() != Some("1");
 
         // GQA GPU envelope (scaling campaign item 1): the phase-1/phase-2
         // kernels are MHA-only, but a GQA input can be served exactly by
@@ -8086,7 +8072,7 @@ pub extern "C" fn nsl_flash_attention_backward(
         // none) reach them too.
         if dout_t.device > 0
             && segment_ids_ptr == 0
-            && !force_cpu_bwd
+            && (!force_cpu_bwd || det_tc_ok)
             && tc_attention_enabled()
             && crate::attention_tc::supports(b, d, h, kv_h, s)
             && crate::attention_tc::device_supported()
@@ -8094,6 +8080,10 @@ pub extern "C" fn nsl_flash_attention_backward(
                 dout_ptr, q_ptr, k_ptr, v_ptr, out_ptr, logsumexp_ptr, scale, b, h, kv_h, s, d, is_causal,
             )
         {
+            if deterministic_mode && !opted_out {
+                // The deterministic route, taken (see `FLASH_BWD_DET_ROUTED`).
+                FLASH_BWD_DET_ROUTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if flash_debug {
                 // `gqa_expanded`: grouped K/V ran expanded to every query head
                 // (`NSL_SDPA_GQA_EXPAND=1`), not in place.
@@ -8105,6 +8095,25 @@ pub extern "C" fn nsl_flash_attention_backward(
                 );
             }
             return list;
+        }
+        if force_cpu_bwd && dout_t.device > 0 {
+            // Counted, not just logged: a gate needs to prove the deterministic
+            // route was actually TAKEN. A determinism test that only compares
+            // two loss streams passes just as well when the kernel it means to
+            // exercise never ran.
+            FLASH_BWD_DET_ROUTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if flash_debug {
+                let why = if bwd_cpu_env.as_deref() == Some("1") {
+                    "NSL_FLASH_BWD_CPU=1"
+                } else {
+                    "--deterministic"
+                };
+                crate::nsl_log!(
+                    INFO,
+                    "flash-bwd",
+                    "[flash-bwd] {why} — deterministic CPU reference backward forced"
+                );
+            }
         }
         if dout_t.dtype == crate::tensor::DTYPE_BF16 || NslTensor::from_ptr(q_ptr).dtype == crate::tensor::DTYPE_BF16 {
             refuse_bf16_attention("backward");
