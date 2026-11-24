@@ -449,16 +449,19 @@ crates/nsl-codegen/tests/tier_b_tile_skip_gpu_parity.rs	tier_b_aligned_docs_s409
 crates/nsl-codegen/tests/track_b_head_dim_128_repro.rs	track_b_d_model_128_rejected_by_validator	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/track_b_head_dim_128_repro.rs	track_b_head_dim_128_d_model_32_launches	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/wggo_sidecar_population.rs	run_harness_stub_with_wggo_hook_populates_wggo_head_gradients	broken	requires cfg(test) BSS stub injection; covered by mod.rs unit test
+crates/nsl-kir/src/kernels/flash_attn/bwd.rs	write_production_backward_ptx	diagnostic	diagnostic: writes PTX files into NSL_FLASH_BWD_PTX_DIR
 crates/nsl-kir/src/kernels/optim.rs	split_round_trips_every_bit_pattern	diagnostic	diagnostic: exhaustive 2^32 sweep of the split round trip (a minute in debug; run --ignored --release)
 crates/nsl-runtime/src/attention_tc.rs	tc_backward_matches_f64_reference_at_realistic_gradient_magnitudes	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	tc_bf16_io_is_the_f32_kernel_rounded_once	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	the_lpt_grid_order_gives_the_same_bits	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	the_bshd_kernels_are_the_contiguous_kernels_bit_for_bit	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
+crates/nsl-runtime/src/attention_tc.rs	the_register_bound_gives_the_same_bits	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	tc_ffi_reads_and_writes_the_bshd_layout	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	tc_backward_small_rows_keep_their_precision	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	grouped_kv_is_the_expanded_computation_up_to_the_group_sum	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	tc_ffi_forward_and_backward_match_the_reference	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	tc_attention_kernel_times	diagnostic	diagnostic: times the tensor-core attention kernels at the production shapes
+crates/nsl-runtime/src/attention_tc.rs	tc_backward_layout_times	diagnostic	diagnostic: times the backward kernels in both head layouts at the 1B and 500M shapes
 crates/nsl-runtime/src/attention_tc.rs	tc_forward_matches_f64_reference	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/c_api/mod.rs	zz_tensor_to_desc_null_child	helper	child process — driven by nsl_tensor_to_desc_null_ptr_does_not_deref
 crates/nsl-runtime/src/cuda/storage_kernels.rs	swiglu_kernel_timing	diagnostic	diagnostic: times the fused SwiGLU kernels on the GPU

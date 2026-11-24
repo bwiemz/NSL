@@ -564,6 +564,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "Route the FlashAttention backward to the deterministic CPU reference (1) or opt out of that routing under --deterministic (0)."
     ),
     var!(
+        "NSL_FLASH_BWD_PTX_DIR",
+        Path,
+        "path to an existing directory",
+        "unset (the diagnostic returns immediately)",
+        Test,
+        Test,
+        "Test harness only: nsl-kir's `write_production_backward_ptx` diagnostic writes the production tensor-core attention kernels' PTX there (for `ptxas -v`)."
+    ),
+    var!(
         "NSL_FLASH_DEBUG",
         Bool,
         "1 only",
@@ -1516,6 +1525,15 @@ pub static REGISTRY: &[EnvVar] = &[
         Perf,
         Runtime,
         "Set to 0 to launch the causal tensor-core attention kernels in tile-major grid order (same results, the previous CTA dispatch order)."
+    ),
+    var!(
+        "NSL_TC_ATTN_MIN_CTAS",
+        Bool,
+        "0 only",
+        "on (the head_dim-64 tensor-core attention backward kernels are register-bounded to 3 CTAs per SM)",
+        Perf,
+        Runtime,
+        "Set to 0 to let ptxas allocate the tensor-core attention backward kernels' registers unbounded (same results, 2 CTAs per SM at head_dim 64)."
     ),
     var!(
         "NSL_TENSOR_TO_DESC_NULL_CHILD",

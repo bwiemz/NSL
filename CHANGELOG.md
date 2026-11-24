@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+<!-- perf round 2 (2026-11-23): register bounds for the head_dim-64 tensor-core attention backward, on top of the [b, s, h, d] layout below. -->
+- **The head_dim-64 tensor-core attention backward keeps 3 CTAs per SM.**
+  - The dQ and dK/dV kernels carry `.minnctapersm 3`. Left to itself, ptxas gave the `[b, s, h, d]` dQ kernel 176 registers (its row strides are run-time values) and dK/dV 213 in either layout. At 128 threads per CTA that leaves room for 2 CTAs per SM instead of 3. Bounded, dQ fits in 168 registers with a 20-byte spill, and dK/dV fits in 168 with none. Head dim 128 stays unbounded: its kernels use about 254 registers on 256 threads.
+  - Register allocation does not change the arithmetic. The bounded kernels give the unbounded ones' bits (`the_register_bound_gives_the_same_bits`), and a 50M model's 12 updates under `--deterministic` give byte-identical checkpoints. `NSL_TC_ATTN_MIN_CTAS=0` restores ptxas's own allocation.
+  - GPU time per call in the training step (nsys, `tools/perfcheck` arm `nsl_bf16s`, 15 updates):
+    - Coder-1B: dQ 472.7 µs instead of 554.7 and dK/dV 687.9 instead of 699.7, 9.6 ms less per update (about 0.9%).
+    - Coder-500M: dQ 80.3 instead of 94.0 and dK/dV 109.9 instead of 111.6, 4.7 ms less per update.
+  - This closes the `[b, s, h, d]` dQ kernel's regression against the contiguous one (497 against 406 µs per call when the layout landed). The tok/s difference is below what an interleaved perfcheck campaign on a shared machine resolved: 0.991x [0.871-1.002] at 1B and 1.003x [0.988-1.025] at 500M over 5 rounds, with four runs rerun because other processes shared the GPU.
+
 <!-- perf round 2 (2026-11-23): the fused LM head's gradient computed in its forward. -->
 - **The fused LM head computes its gradient in the forward.**
   - When a training step's fused linear cross-entropy head (`@fused_lm_ce`, biasless, GEMM route) has the loss seed itself as its upstream gradient, and its weight gradient goes to a FASE accumulation buffer (the parameter's whole adjoint, or the tied embedding's in-place sum), the forward runs the head's whole backward: per chunk of 1,024 token rows (96 MiB of bf16 logits at a 49,152 vocabulary), one logits GEMM, one KIR kernel (`nsl_lce_rows_grad_bf16`) that writes each row's loss and its dlogits times `1 / num_valid` in place, the dx GEMM, and the dW GEMM accumulated with `alpha = 1/N, beta = 1` into the accumulation buffer. The backward hands the saved x gradient on, and the head's input is freed right after the head when nothing else reads it. No logits recompute, no f32 dlogits and their cast, full-width GEMMs: per Coder-1B update the head takes 72.7 ms of GPU time instead of 106.9 (GEMMs 66.6 instead of 93.7, softmax kernels 6.1 instead of 13.2) and the casts 4.5 ms less (nsys; Coder-500M 49.4 instead of 68.4 ms, casts 2.3 ms less).

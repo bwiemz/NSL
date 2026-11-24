@@ -152,6 +152,15 @@ fn lpt_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("NSL_TC_ATTN_LPT").ok().as_deref() != Some("0"))
 }
 
+/// Whether the backward kernels keep their default register bounds
+/// ([`BwdConfig::default_min_ctas`]: 3 CTAs per SM at head_dim 64).
+/// `NSL_TC_ATTN_MIN_CTAS=0` lets ptxas choose (the same results, the previous
+/// register allocation); read once.
+fn min_ctas_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NSL_TC_ATTN_MIN_CTAS").ok().as_deref() != Some("0"))
+}
+
 /// The heaviest-first grid puts the tile count in `gridDim.y`.
 fn lpt_fits(tiles: u32) -> bool {
     u64::from(tiles) <= MAX_GRID_Y
@@ -242,12 +251,20 @@ pub(crate) fn backward_io(a: &BwdLaunch, io: nsl_kir::kernels::storage::Storage)
 /// [`backward_io`] with every operand in the `[batch, seq, heads, head_dim]`
 /// layout when `bshd` ([`supports_bshd`] must hold).
 pub(crate) fn backward_io_layout(a: &BwdLaunch, io: nsl_kir::kernels::storage::Storage, bshd: bool) -> CUresult {
-    let cfg = BwdConfig::new(a.head_dim as u32, a.causal).with_io(io).with_bshd(bshd);
+    let cfg = backward_config(a, io, bshd, min_ctas_enabled());
     let seq = a.seq as u32;
     let lpt = lpt_enabled()
         && lpt_fits(seq.div_ceil(cfg.dq_block_m()))
         && lpt_fits(seq.div_ceil(cfg.dkdv_block_n()));
     backward_with(cfg.with_lpt(lpt), a, [true, true, true])
+}
+
+/// The backward variant [`backward_io_layout`] launches before the grid order
+/// is chosen: the default tilings and register bounds, or (`min_ctas` off,
+/// `NSL_TC_ATTN_MIN_CTAS=0`) no register bounds.
+fn backward_config(a: &BwdLaunch, io: nsl_kir::kernels::storage::Storage, bshd: bool, min_ctas: bool) -> BwdConfig {
+    let cfg = BwdConfig::new(a.head_dim as u32, a.causal).with_io(io).with_bshd(bshd);
+    if min_ctas { cfg } else { cfg.with_dq_min_ctas(0).with_dkdv_min_ctas(0) }
 }
 
 /// [`backward`] with explicit tilings, launching only the kernels `run`
@@ -506,6 +523,26 @@ pub(crate) mod tests {
         // row) and f32 accumulation.
         assert!(ro < 5e-4, "O vs f16-operand model: {ro} at {iro}");
         assert!(rl < 2e-5 * (1.0 + amp_q as f64), "lse vs f16-operand model: {rl} at {irl}");
+    }
+
+    /// The launcher keeps the default register bounds unless the kill switch
+    /// is off, and then drops both (dQ and dK/dV), at either head dim.
+    #[test]
+    fn the_min_ctas_switch_drops_both_register_bounds() {
+        use nsl_kir::kernels::storage::Storage;
+        for (head_dim, bound) in [(64, 3), (128, 0)] {
+            let a = BwdLaunch {
+                q: 0, k: 0, v: 0, o: 0, lse: 0, dout: 0, dq: 0, dk: 0, dv: 0, dvec: 0, gmax: 0,
+                batch: 2, heads: 8, kv_heads: 2, seq: 256, head_dim, scale: 0.125, causal: true,
+            };
+            for bshd in [false, true] {
+                let on = backward_config(&a, Storage::Bf16, bshd, true);
+                assert_eq!((on.dq_min_ctas, on.dkdv_min_ctas), (bound, bound));
+                let off = backward_config(&a, Storage::Bf16, bshd, false);
+                assert_eq!((off.dq_min_ctas, off.dkdv_min_ctas), (0, 0));
+                assert_eq!(off, on.with_dq_min_ctas(0).with_dkdv_min_ctas(0), "only the bounds differ");
+            }
+        }
     }
 
     fn gpu() -> bool {
@@ -1034,6 +1071,46 @@ pub(crate) mod tests {
         }
     }
 
+    /// The default register bound changes how ptxas allocates the dQ and
+    /// dK/dV kernels' registers and nothing else: dQ, dK and dV are the
+    /// unbounded kernels' bits, in both layouts and both storages, causal or
+    /// not, with grouped K/V and ragged tails.
+    #[test]
+    #[ignore = "requires a CUDA GPU; run with --features cuda -- --ignored"]
+    fn the_register_bound_gives_the_same_bits() {
+        if !gpu() {
+            return;
+        }
+        use nsl_kir::kernels::storage::Storage;
+        let cases = [
+            (Shape { b: 2, h: 8, kvh: 2, s: 333, d: 64, causal: true }, Storage::Bf16, true),
+            (Shape { b: 2, h: 8, kvh: 2, s: 256, d: 64, causal: true }, Storage::F32, false),
+            (Shape { b: 2, h: 4, kvh: 4, s: 130, d: 64, causal: false }, Storage::Bf16, false),
+            (Shape { b: 1, h: 6, kvh: 3, s: 200, d: 64, causal: true }, Storage::F32, true),
+        ];
+        for (n, (sh, io, bshd)) in cases.into_iter().enumerate() {
+            let w = io.bytes();
+            let mut rng = Lcg(0x3c7 + n as u64);
+            let qh = |x: Vec<u8>| if bshd { permute_heads(&x, sh.b, sh.h, sh.s, sh.d, w, true) } else { x };
+            let kh = |x: Vec<u8>| if bshd { permute_heads(&x, sh.b, sh.kvh, sh.s, sh.d, w, true) } else { x };
+            let q = qh(to_bytes(&rng.vec(sh.b * sh.h * sh.s * sh.d, 1.0), io));
+            let k = kh(to_bytes(&rng.vec(sh.b * sh.kvh * sh.s * sh.d, 1.0), io));
+            let v = kh(to_bytes(&rng.vec(sh.b * sh.kvh * sh.s * sh.d, 1.0), io));
+            let dout = qh(to_bytes(&rng.vec(sh.b * sh.h * sh.s * sh.d, 1e-6), io));
+            let f = FwdConfig::new(sh.d as u32, sh.causal).with_io(io).with_lpt(true).with_bshd(bshd);
+            let b = BwdConfig::new(sh.d as u32, sh.causal).with_io(io).with_lpt(true).with_bshd(bshd);
+            assert_eq!((b.dq_min_ctas, b.dkdv_min_ctas), (3, 3));
+            let bounded = raw_run(sh, f, b, &q, &k, &v, &dout);
+            let free = raw_run(sh, f, b.with_dq_min_ctas(0).with_dkdv_min_ctas(0), &q, &k, &v, &dout);
+            for (what, x, y) in
+                [("dQ", &bounded.dq, &free.dq), ("dK", &bounded.dk, &free.dk), ("dV", &bounded.dv, &free.dv)]
+            {
+                assert!(x.iter().any(|&byte| byte != 0xFF), "{sh:?} {what}: unwritten");
+                assert!(x == y, "{sh:?} {io:?} bshd={bshd} {what}: the register bound changed the result");
+            }
+        }
+    }
+
     /// The runtime entry points with operands in the attention layout: the
     /// head views `x.reshape([b, s, h, d]).transpose(1, 2)` reach the
     /// tensor-core kernels in place, the output and the gradients come back
@@ -1555,6 +1632,91 @@ pub(crate) mod tests {
             eprintln!("{label}: whole backward (defaults) {tb:.3} ms");
             for p in [qd, kd, vd, dod, od, ld, dqd, dkd, dvd, dvec, gmax] {
                 inner::free_managed(p);
+            }
+        }
+    }
+
+    /// The backward kernels at the 1B and 500M production configurations
+    /// (GQA, bf16, causal, heaviest first) in the contiguous and the `[b, s,
+    /// h, d]` layout, unbounded and with the 3-CTA register bound: median GPU
+    /// time per call of dQ and of dK/dV.
+    #[test]
+    #[ignore = "diagnostic: times the backward kernels in both head layouts at the 1B and 500M shapes"]
+    fn tc_backward_layout_times() {
+        if !gpu() {
+            return;
+        }
+        use nsl_kir::kernels::storage::Storage;
+        let io = Storage::Bf16;
+        let w = io.bytes();
+        for (label, sh) in [
+            ("1B gqa", Shape { b: 2, h: 32, kvh: 8, s: 2048, d: 64, causal: true }),
+            ("500M gqa", Shape { b: 2, h: 20, kvh: 10, s: 1024, d: 64, causal: true }),
+        ] {
+            assert!(supports_bshd(sh.b, sh.d, sh.h, sh.kvh, sh.s));
+            let (n_q, n_kv, n_l) = (sh.b * sh.h * sh.s * sh.d, sh.b * sh.kvh * sh.s * sh.d, sh.b * sh.h * sh.s);
+            let mut rng = Lcg(0xd9);
+            let q = to_bytes(&rng.vec(n_q, 1.0), io);
+            let k = to_bytes(&rng.vec(n_kv, 1.0), io);
+            let v = to_bytes(&rng.vec(n_kv, 1.0), io);
+            let dout = to_bytes(&rng.vec(n_q, 1e-6), io);
+            let up = |bytes: &[u8]| {
+                let p = inner::alloc_managed(bytes.len());
+                inner::memcpy_htod(p, bytes.as_ptr() as *const c_void, bytes.len());
+                p
+            };
+            let fresh = |n: usize| {
+                let p = inner::alloc_managed(n);
+                inner::memset_d8_value(p, 0xFF, n);
+                p
+            };
+            for bshd in [false, true] {
+                let name = if bshd { "bshd" } else { "bhsd" };
+                let qh = |x: &[u8]| if bshd { permute_heads(x, sh.b, sh.h, sh.s, sh.d, w, true) } else { x.to_vec() };
+                let kh = |x: &[u8]| if bshd { permute_heads(x, sh.b, sh.kvh, sh.s, sh.d, w, true) } else { x.to_vec() };
+                let (qd, kd, vd, dod) = (up(&qh(&q)), up(&kh(&k)), up(&kh(&v)), up(&qh(&dout)));
+                let (od, ld) = (fresh(n_q * w), fresh(n_l * 4));
+                let (dqd, dkd, dvd) = (fresh(n_q * w), fresh(n_kv * w), fresh(n_kv * w));
+                let (dvec, gmax) = (fresh(n_l * 4), fresh(sh.b * sh.h * 4));
+                let f = FwdConfig::new(sh.d as u32, sh.causal).with_io(io).with_lpt(true).with_bshd(bshd);
+                let b = BwdConfig::new(sh.d as u32, sh.causal).with_io(io).with_lpt(true).with_bshd(bshd);
+                let fl = FwdLaunch {
+                    q: qd as u64, k: kd as u64, v: vd as u64, o: od as u64, lse: ld as u64,
+                    batch: sh.b, heads: sh.h, kv_heads: sh.kvh, seq: sh.s, head_dim: sh.d, scale: 0.125, causal: sh.causal,
+                };
+                let bl = BwdLaunch {
+                    q: qd as u64, k: kd as u64, v: vd as u64, o: od as u64, lse: ld as u64, dout: dod as u64,
+                    dq: dqd as u64, dk: dkd as u64, dv: dvd as u64, dvec: dvec as u64, gmax: gmax as u64,
+                    batch: sh.b, heads: sh.h, kv_heads: sh.kvh, seq: sh.s, head_dim: sh.d, scale: 0.125, causal: sh.causal,
+                };
+                assert_eq!(forward_with(f, &fl), CUresult::CUDA_SUCCESS);
+                assert_eq!(backward_with(b, &bl, [true, false, false]), CUresult::CUDA_SUCCESS);
+                let t0 = std::time::Instant::now();
+                while t0.elapsed().as_secs_f64() < 1.0 {
+                    assert_eq!(backward_with(b, &bl, [false, true, true]), CUresult::CUDA_SUCCESS);
+                    unsafe { cudarc::driver::sys::cuCtxSynchronize() };
+                }
+                // Alternate the bounds so clock drift lands on both alike; report
+                // the median of each.
+                let mut ts: [[Vec<f64>; 2]; 2] = Default::default();
+                for _ in 0..6 {
+                    for (i, m) in [0, 3].into_iter().enumerate() {
+                        let bm = b.with_dq_min_ctas(m).with_dkdv_min_ctas(m);
+                        ts[i][0].push(gpu_ms_per_call(&|| backward_with(bm, &bl, [false, true, false]), 50));
+                        ts[i][1].push(gpu_ms_per_call(&|| backward_with(bm, &bl, [false, false, true]), 50));
+                    }
+                }
+                let med = |v: &mut Vec<f64>| {
+                    v.sort_by(f64::total_cmp);
+                    v[v.len() / 2]
+                };
+                for (i, m) in [0, 3].into_iter().enumerate() {
+                    let (dq, dkdv) = (med(&mut ts[i][0]), med(&mut ts[i][1]));
+                    eprintln!("{label} bf16 lpt {name} min_ctas {m}: dQ {dq:.3} ms, dK/dV {dkdv:.3} ms (median of 6)");
+                }
+                for p in [qd, kd, vd, dod, od, ld, dqd, dkd, dvd, dvec, gmax] {
+                    inner::free_managed(p);
+                }
             }
         }
     }
