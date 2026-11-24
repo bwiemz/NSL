@@ -1009,7 +1009,17 @@ pub(crate) fn gemm_forward_grad(
     h: u64,
     scale: f32,
     dw_alpha: f32,
+    // `dw` is zero in value but not in bytes (`crate::accum_fresh`): the
+    // first GEMM that writes it must overwrite.
+    dw_fresh: bool,
 ) -> (u32, GradRoute) {
+    // With no rows no GEMM writes dw: zero a fresh one here instead.
+    let dw_fresh = if dw_fresh && rows == 0 {
+        crate::cuda::inner::memset_d8(dw_dev as *mut c_void, (v * h * 4) as usize);
+        false
+    } else {
+        dw_fresh
+    };
     if let Some(head) = RowHead::new(x_dev, w_dev, rows, v, h) {
         let rc = row_chunked(
             &head,
@@ -1022,8 +1032,13 @@ pub(crate) fn gemm_forward_grad(
             h,
             scale,
             dw_alpha,
+            dw_fresh,
         );
         return (rc, GradRoute::RowChunked);
+    }
+    if dw_fresh {
+        // The vocabulary-chunked route adds each chunk's rows: zero first.
+        crate::cuda::inner::memset_d8(dw_dev as *mut c_void, (v * h * 4) as usize);
     }
     let lse = crate::cuda::inner::alloc_managed((rows * 4) as usize) as u64;
     let mut rc = gemm_forward(
@@ -1073,6 +1088,7 @@ fn row_chunked(
     h: u64,
     scale: f32,
     dw_alpha: f32,
+    dw_fresh: bool,
 ) -> u32 {
     use crate::cuda::inner;
     use crate::cuda::storage_gemm::gemm16;
@@ -1138,10 +1154,12 @@ fn row_chunked(
                 )
             };
         }
-        // dW += dw_alpha · dlogits^T @ x16[r0.., :]   [v, h]
+        // dW += dw_alpha · dlogits^T @ x16[r0.., :]   [v, h]; the first chunk
+        // overwrites a fresh accumulator (every chunk's GEMM covers all of dW).
+        let dw_beta = if dw_fresh && r0 == 0 { 0.0 } else { 1.0 };
         unsafe {
             gemm16(
-                false, true, h, v, r, dw_alpha, x16r, h, logits, v, 1.0, dw_dev, h, false,
+                false, true, h, v, r, dw_alpha, x16r, h, logits, v, dw_beta, dw_dev, h, false,
             )
         };
         r0 += r;

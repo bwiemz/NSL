@@ -686,6 +686,9 @@ pub extern "C" fn nsl_embedding_backward_accum(
     indices_ptr: i64,
     scale: f64,
 ) {
+    // The scatter adds rows into the accumulator: a fresh one
+    // (`crate::accum_fresh`) is zeroed first.
+    crate::accum_fresh::materialize(acc_ptr);
     {
         let acc = NslTensor::from_ptr_ref(acc_ptr);
         let grad = NslTensor::from_ptr_ref(grad_ptr);

@@ -4389,6 +4389,16 @@ pub(crate) fn gpu_wgrad_accum_f32(
 
     inner::ensure_context();
 
+    // beta = 1.0: ACCUMULATE into m_partial rather than overwrite it. This is
+    // the whole point of the fusion; a 0.0 here would silently discard every
+    // earlier micro-batch's contribution. The one exception is a buffer
+    // `crate::accum_fresh` holds as fresh: zero in value, its bytes stale, so
+    // this write must not read it.
+    let beta = if crate::accum_fresh::claim(m_ptr) {
+        0.0
+    } else {
+        1.0
+    };
     // SAFETY: all three are device f32 buffers of the sizes asserted above,
     // validated by `nsl_tensor_wgrad_accum` before dispatch.
     let res = unsafe {
@@ -4400,10 +4410,7 @@ pub(crate) fn gpu_wgrad_accum_f32(
             d_in,
             d_out,
             scale,
-            // beta = 1.0: ACCUMULATE into m_partial rather than overwrite it.
-            // This is the whole point of the fusion; a 0.0 here would silently
-            // discard every earlier micro-batch's contribution.
-            1.0,
+            beta,
         )
     };
     if let Err(e) = res {
@@ -4690,6 +4697,9 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
     // `first_moment_dtype="bf16"`: every `m_ptrs` entry points at bf16, and
     // the bf16-`m` kernel (same signature and grid) is launched.
     m_bf16: bool,
+    // Leave every `mp` in place (the `_keepmp` kernel): the caller marks the
+    // buffers fresh (`crate::accum_fresh`) instead of having them zeroed.
+    keep_mp: bool,
 ) {
     let k = t_ptrs.len();
     if k == 0 {
@@ -4852,7 +4862,11 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi(
         &mut mp_scale_val as *mut _ as *mut c_void,
     ];
     let grid_x = blk_count as i64;
-    let (ptx, name): (&str, &[u8]) = if m_bf16 {
+    let (ptx, name): (&str, &[u8]) = if keep_mp {
+        let (ptx, name) =
+            kernels::fase_multi_keep_mp_ptx(nsl_kir::kernels::optim::Theta::F32, m_bf16);
+        (ptx.as_str(), name.as_bytes())
+    } else if m_bf16 {
         (kernels::fase_fused_adamw_multi_f32_mbf16_ptx(), b"nsl_fase_fused_adamw_multi_f32_mbf16\0")
     } else {
         (kernels::fase_fused_adamw_multi_f32_ptx(), b"nsl_fase_fused_adamw_multi_f32\0")

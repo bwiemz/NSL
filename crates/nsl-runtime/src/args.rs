@@ -134,6 +134,19 @@ pub extern "C" fn nsl_args_init(argc: i32, argv: i64) {
         }
     }
 
+    // Fresh accumulators (`crate::accum_fresh`): how many the optimizer step
+    // marked, how many a first write overwrote and how many were zeroed, the
+    // gate's evidence that the overwrite ran (a bit-identical result is also
+    // what a never-engaged protocol gives).
+    if std::env::var("NSL_ACCUM_COUNTER").ok().as_deref() == Some("1") {
+        unsafe extern "C" {
+            fn atexit(cb: extern "C" fn()) -> i32;
+        }
+        unsafe {
+            atexit(nsl_accum_count_atexit);
+        }
+    }
+
     // mfu-fusion C3: fused elementwise-chain launch vs decomposed-replay
     // counts, enabled when NSL_FUSED_EW_COUNTER=1 (or NSL_EVENTS, which gets
     // the machine twin regardless). Same anti-vacuity rationale as the wgrad
@@ -536,6 +549,13 @@ extern "C" fn nsl_bf16_lt_atexit() {
     );
     use std::io::Write;
     let _ = std::io::stderr().lock().write_all(report.as_bytes());
+}
+
+extern "C" fn nsl_accum_count_atexit() {
+    let (marked, claimed, zeroed) = crate::accum_fresh::counts();
+    let line = format!("[accum] marked={marked} overwritten={claimed} zeroed={zeroed}\n");
+    use std::io::Write;
+    let _ = std::io::stderr().lock().write_all(line.as_bytes());
 }
 
 extern "C" fn nsl_wgrad_count_atexit() {

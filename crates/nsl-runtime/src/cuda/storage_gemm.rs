@@ -405,11 +405,34 @@ pub(crate) fn wgrad_accum(m_ptr: i64, x_ptr: i64, g_ptr: i64, n_rows: u64, d_in:
     assert_eq!(m.dtype, DTYPE_F32, "wgrad accumulate: the gradient buffer must be f32");
     let x16 = operand16(x, x.len as usize);
     let g16 = operand16(g, g.len as usize);
+    // A fresh accumulator (`crate::accum_fresh`) is zero in value: overwrite
+    // it. The plan cache keys on the shape, not beta, so both betas run the
+    // same kernel, and `alpha·acc + 0` is `alpha·acc`.
+    let beta = if crate::accum_fresh::claim(m_ptr) {
+        0.0
+    } else {
+        1.0
+    };
     // Column-major C_cm[d_out, d_in] = G_cm[d_out, N] * X_cm^T, as
     // `sgemm_wgrad_accum` issues it.
     // SAFETY: sizes as asserted by the caller (`nsl_tensor_wgrad_accum`).
     unsafe {
-        gemm16(false, true, d_out, d_in, n_rows, scale, g16.ptr, d_out, x16.ptr, d_in, 1.0, m.data as u64, d_out, false);
+        gemm16(
+            false,
+            true,
+            d_out,
+            d_in,
+            n_rows,
+            scale,
+            g16.ptr,
+            d_out,
+            x16.ptr,
+            d_in,
+            beta,
+            m.data as u64,
+            d_out,
+            false,
+        );
     }
     drop(x16);
     drop(g16);
