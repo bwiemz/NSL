@@ -406,6 +406,11 @@ impl Compiler<'_> {
         }
         self.add_norm_stash.clear();
         self.add_norm_groups = None;
+        // Round 3: the witness of the one-pass RMSNorm backward, per train block.
+        let norm_bwd = std::mem::take(&mut self.norm_bwd_fused);
+        if norm_bwd > 0 {
+            nsl_log::nsl_log!(INFO, "fuse", "[fuse] rmsnorm dx+dgamma passes: {norm_bwd}");
+        }
         // Item 17 phase 3a: the packing-metadata variables belong to the
         // train-step function this block just built — a later function
         // (another train block, a grad block, a model method) using them
