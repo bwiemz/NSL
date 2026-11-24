@@ -589,6 +589,18 @@ pub enum KirOp {
     /// shared memory (the flash-attention P and dS tiles), and how f32
     /// tensor data becomes an f16 operand.
     CvtPack { dst: VarId, hi: VarId, lo: VarId, ty: MmaOperandTy },
+    /// Round four `F32` values to OCP E4M3 (round to nearest even,
+    /// saturating to ±448; NaN stays NaN) and pack the bytes into the `U32`
+    /// `dst` in memory order: `vals[0]` in the low byte, `vals[3]` in the
+    /// high byte, so a 4-byte store writes them as four consecutive E4M3
+    /// elements. Two `cvt.rn.satfinite.e4m3x2.f32` into scoped `.b16`
+    /// registers, then `mov.b32 dst, {lo, hi}`: the conversion writes a
+    /// 16-bit register, which KIR's `U16` (a 32-bit `%r`) is not. sm_89+
+    /// with PTX ISA 8.1 ([`FeatureSet::FP8_CONVERT`]).
+    PackE4m3x4 {
+        dst: VarId,
+        vals: [VarId; 4],
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -829,6 +841,7 @@ impl KirBuilder {
                     self.required_features |= FeatureSet::BF16_ARITHMETIC;
                 }
             }
+            KirOp::PackE4m3x4 { .. } => self.required_features |= FeatureSet::FP8_CONVERT,
             KirOp::AtomicAdd(_, _, AddressSpace::Global) => {
                 // Float atomics need ATOMIC_FLOAT; integer atomics are universal
                 self.required_features |= FeatureSet::ATOMIC_FLOAT;

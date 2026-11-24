@@ -750,6 +750,7 @@ pub fn op_dst(op: &KirOp) -> Option<VarId> {
         | KirOp::SharedBase(d) => Some(*d),
         KirOp::SharedRegion { dst, .. } => Some(*dst),
         KirOp::CvtPack { dst, .. } => Some(*dst),
+        KirOp::PackE4m3x4 { dst, .. } => Some(*dst),
         KirOp::Store(_, _, _)
         | KirOp::AtomicAdd(_, _, _)
         | KirOp::AtomicMax(_, _, _)
@@ -822,6 +823,7 @@ pub fn op_uses(op: &KirOp) -> Vec<VarId> {
         KirOp::Store(p, v, _) | KirOp::AtomicAdd(p, v, _) | KirOp::AtomicMax(p, v, _) => vec![*p, *v],
         KirOp::CpAsync { dst, src, .. } => vec![*dst, *src],
         KirOp::CvtPack { hi, lo, .. } => vec![*hi, *lo],
+        KirOp::PackE4m3x4 { vals, .. } => vals.to_vec(),
         KirOp::LdMatrix { addr, .. } => vec![*addr],
         KirOp::Mma { a, b, c, .. } => {
             let mut v = a.clone();
@@ -1292,6 +1294,13 @@ fn check_types(
             expect(*dst, "packed fragment", &pack_ty.fragment_ty());
             expect(*hi, "hi", &KirType::F32);
             expect(*lo, "lo", &KirType::F32);
+        }
+        // Rule 6: four f32 sources, the packed bytes in a `U32`.
+        KirOp::PackE4m3x4 { dst, vals } => {
+            expect(*dst, "packed e4m3x4", &KirType::U32);
+            for v in vals {
+                expect(*v, "e4m3 source", &KirType::F32);
+            }
         }
         KirOp::CpAsyncCommit
         | KirOp::CpAsyncWait { .. }

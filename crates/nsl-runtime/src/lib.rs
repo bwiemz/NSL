@@ -92,6 +92,9 @@ mod abi_check;
 pub mod tensor;
 pub(crate) mod cpu;
 pub(crate) mod cuda;
+/// MXFP8 GEMM building blocks (E4M3 + per-32 UE8M0 scales through cublasLt).
+#[cfg(feature = "cuda")]
+pub mod mxfp8;
 
 // Doc-hidden re-exports for cross-crate integration tests
 // (see crates/nsl-codegen/tests/csha_cuda_launch_*). Keeping the cuda

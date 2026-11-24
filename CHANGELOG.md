@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+<!-- FP8 phase 1 (2026-11-24): MXFP8 quantizers and the cublasLt MXFP8 GEMM, not yet routed from training. -->
+- **MXFP8 GEMM building blocks: E4M3 operands with one power-of-two scale per 32 elements, multiplied by cublasLt.**
+  - Why: GEMMs take about 70% of a production update, and they already run at cuBLAS's bf16 rate. On the RTX PRO 4500 Blackwell (sm_120), cublasLt's FP8 GEMMs run 1.7-2.4x the bf16 rate at every Coder-1B GEMM shape. With one UE8M0 scale per 32 elements along K (`VEC32_UE8M0`, the OCP MX format) they run 1.7-2.3x. Measured with the heuristic's best of 16 candidates.
+  - Two KIR kernels (`nsl_kir::kernels::mx_quant`) quantize f32 or bf16 data. `Rows` puts the blocks along each row. `ColsT` puts them along each column and writes the transpose, because cublasLt wants both operands K-major.
+  - The scale is the smallest power of two that keeps the block's largest magnitude within 448, computed exactly from the bits, so nothing saturates. A block holding NaN or Inf gets the UE8M0 NaN.
+  - The kernels write the scales in cublasLt's 128 × 4 tile layout.
+  - KIR gains `PackE4m3x4` (two `cvt.rn.satfinite.e4m3x2.f32`) and the `FP8_CONVERT` feature (sm_89, PTX ISA 8.1).
+  - `nsl_runtime::mxfp8` launches the quantizers and the GEMM (`lt_matmul::matmul_mxfp8`: TN, f32 accumulation, bf16 or f32 output, `beta = 1` accumulation, its own plan cache and counters).
+  - Nothing in training routes here yet. Using it is the next step.
+  - Verified:
+    - The quantizers write the host reference's bytes exactly: every data byte and every scale byte, f32 and bf16 sources, zero, subnormal, saturation-edge and non-finite blocks, ragged and production shapes, padded scale tiles (`mx_quant_gpu`).
+    - The GEMM is the f64 product of the dequantized operands, with per-block scales spread over 2^±20. At the Coder-1B gate+up weight-gradient shape (K = 4096) the largest error is 6.7e-7 of `sum |a·b|`.
+    - Each block's scale lands on its own block. This is checked without the reference's layout function: one operand selects a single K block per output, and the other has a distinct power-of-two scale per block with values E4M3 holds exactly. So every output is an exact sum, and a misplaced scale is off by a power of two. A NaN block turns its row NaN and leaves the others finite.
+
 <!-- perf round 3 (2026-11-24): fresh gradient accumulators instead of the AdamW step's zero store. -->
 - **The AdamW step no longer zeroes the gradient accumulators; the next window's first writes overwrite them.**
   - Under the FASE-Deferred source-AD hook every parameter gradient is added into its accumulation buffer as it is computed. The fused multi-tensor AdamW step used to store zeros into every buffer after reading it (4 bytes per parameter: at Coder-1B 6.5 of its 47 ms), and the first micro-batch of the next window then read those zeros back in each weight-gradient GEMM's `beta = 1` epilogue.

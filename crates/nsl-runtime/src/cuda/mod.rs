@@ -39,6 +39,9 @@ pub(crate) mod bf16_cast_cache;
 pub(crate) mod lt_matmul;
 
 #[cfg(feature = "cuda")]
+pub(crate) mod mx_quant;
+
+#[cfg(feature = "cuda")]
 pub(crate) mod storage_kernels;
 
 #[cfg(feature = "cuda")]

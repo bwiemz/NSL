@@ -837,9 +837,11 @@ fn tune_budget_allows(tuned_so_far: u64) -> bool {
     tuned_so_far < TUNE_BUDGET_SHAPES
 }
 
-/// Shapes timed so far, both paths.
+/// Shapes timed so far, every path (bf16, TF32, MXFP8).
 fn shapes_tuned() -> u64 {
-    TUNED.load(Ordering::Relaxed) + TF32_TUNED.load(Ordering::Relaxed)
+    TUNED.load(Ordering::Relaxed)
+        + TF32_TUNED.load(Ordering::Relaxed)
+        + MX_TUNED.load(Ordering::Relaxed)
 }
 
 fn print_budget_once() {
@@ -1426,6 +1428,9 @@ pub(crate) fn reset_for_test() {
         ISSUED.store(0, Ordering::Relaxed);
         TUNED.store(0, Ordering::Relaxed);
         FALLBACKS.store(0, Ordering::Relaxed);
+        MX_ISSUED.store(0, Ordering::Relaxed);
+        MX_TUNED.store(0, Ordering::Relaxed);
+        MX_FALLBACKS.store(0, Ordering::Relaxed);
         return;
     }
     // Drain inside the cache, destroy outside it: `destroy_handles` is a
@@ -1442,12 +1447,403 @@ pub(crate) fn reset_for_test() {
         // SAFETY: as above.
         unsafe { destroy_handles(p.desc, p.adesc, p.bdesc, p.cdesc) };
     }
+    let drained: Vec<Option<Plan>> =
+        with_mx_plans(|plans| std::mem::take(plans).into_values().collect());
+    for p in drained.into_iter().flatten() {
+        // SAFETY: as above.
+        unsafe { destroy_handles(p.desc, p.adesc, p.bdesc, p.cdesc) };
+    }
     TF32_ISSUED.store(0, Ordering::Relaxed);
     TF32_TUNED.store(0, Ordering::Relaxed);
     TF32_FALLBACKS.store(0, Ordering::Relaxed);
     ISSUED.store(0, Ordering::Relaxed);
     TUNED.store(0, Ordering::Relaxed);
     FALLBACKS.store(0, Ordering::Relaxed);
+    MX_ISSUED.store(0, Ordering::Relaxed);
+    MX_TUNED.store(0, Ordering::Relaxed);
+    MX_FALLBACKS.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// MXFP8 GEMMs: E4M3 operands with one UE8M0 scale per 32 elements along K
+// (`CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0`), f32 accumulation.
+//
+// cublasLt takes FP8 only in the "TN" form on sm_120: both operands K-major.
+// In column-major terms `D[m, n] = alpha · A^T B + beta · C`, where A is
+// stored as `m` rows of `k` bytes (lda = k) and B as `n` rows of `k` bytes
+// (ldb = k): exactly the `[outer, k]` row-major images
+// `nsl_kir::kernels::mx_quant` writes, with their scales in cublasLt's tiled
+// layout. C/D are bf16 or f32 (`ldc` elements apart).
+//
+// Plans are keyed by `(m, n, k, ldc, c_bf16, alignment class)` in their own
+// map. The scale pointers are not part of a plan: they are set on the cached
+// descriptor before each launch, which reads them at enqueue time (all GPU
+// work is single-threaded on one stream, as above).
+// ---------------------------------------------------------------------------
+
+/// `(m, n, k, ldc, c_bf16, log2 of the pointer alignment class)`.
+type MxKey = (i32, i32, i32, i32, bool, u32);
+
+#[derive(Default)]
+struct MxPlanCache(HashMap<MxKey, Option<Plan>>);
+
+fn with_mx_plans<R>(f: impl FnOnce(&mut HashMap<MxKey, Option<Plan>>) -> R) -> R {
+    super::context::current().with_cache(|c: &mut MxPlanCache| f(&mut c.0))
+}
+
+static MX_ISSUED: AtomicU64 = AtomicU64::new(0);
+static MX_TUNED: AtomicU64 = AtomicU64::new(0);
+static MX_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// (issued, tuned shapes, declined) MXFP8 GEMMs.
+pub(crate) fn mx_stats() -> (u64, u64, u64) {
+    (
+        MX_ISSUED.load(Ordering::Relaxed),
+        MX_TUNED.load(Ordering::Relaxed),
+        MX_FALLBACKS.load(Ordering::Relaxed),
+    )
+}
+
+/// Point the descriptor's A/B block-scale attributes at `a_scales` /
+/// `b_scales`. `false` when cublasLt refuses either.
+unsafe fn mx_set_scale_pointers(
+    desc: lt::cublasLtMatmulDesc_t,
+    a_scales: *const std::ffi::c_void,
+    b_scales: *const std::ffi::c_void,
+) -> bool {
+    use lt::cublasLtMatmulDescAttributes_t as D;
+    let ok = lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS;
+    let set = |attr, p: &*const std::ffi::c_void| {
+        // SAFETY: the attribute holds a device pointer, passed by address.
+        unsafe {
+            lt::cublasLtMatmulDescSetAttribute(
+                desc,
+                attr,
+                p as *const *const std::ffi::c_void as *const std::ffi::c_void,
+                std::mem::size_of::<*const std::ffi::c_void>(),
+            ) == ok
+        }
+    };
+    set(D::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &a_scales)
+        && set(D::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &b_scales)
+}
+
+/// Build the TN MXFP8 descriptor set for one shape, query the heuristic, and
+/// (when tuning is on) time the candidates on the live operands.
+#[allow(clippy::too_many_arguments)]
+unsafe fn build_mx_plan(
+    handle: lt::cublasLtHandle_t,
+    m: i32,
+    n: i32,
+    k: i32,
+    a: *const std::ffi::c_void,
+    a_scales: *const std::ffi::c_void,
+    b: *const std::ffi::c_void,
+    b_scales: *const std::ffi::c_void,
+    ldc: i32,
+    align_log2: u32,
+    c_bf16: bool,
+) -> Option<Plan> {
+    use lt::cublasLtMatmulDescAttributes_t as D;
+    let ok = lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS;
+    let (_, ws_bytes) = workspace();
+    let c_type = if c_bf16 {
+        lt::cudaDataType_t::CUDA_R_16BF
+    } else {
+        lt::cudaDataType_t::CUDA_R_32F
+    };
+    let e4m3 = lt::cudaDataType_t::CUDA_R_8F_E4M3;
+    let align = 1u32 << align_log2;
+    let mut desc: lt::cublasLtMatmulDesc_t = std::ptr::null_mut();
+    let mut adesc: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+    let mut bdesc: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+    let mut cdesc: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+    // SAFETY: out-pointers to live locals; every status is checked and the
+    // half-built set is destroyed on failure.
+    let built = unsafe {
+        'build: {
+            if lt::cublasLtMatmulDescCreate(
+                &mut desc,
+                lt::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                lt::cudaDataType_t::CUDA_R_32F,
+            ) != ok
+            {
+                break 'build false;
+            }
+            let set_i32 = |attr, v: i32| {
+                lt::cublasLtMatmulDescSetAttribute(
+                    desc,
+                    attr,
+                    &v as *const i32 as *const std::ffi::c_void,
+                    4,
+                ) == ok
+            };
+            let vec32 =
+                lt::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0 as i32;
+            if !set_i32(D::CUBLASLT_MATMUL_DESC_TRANSA, 1)
+                || !set_i32(D::CUBLASLT_MATMUL_DESC_TRANSB, 0)
+                || !set_i32(D::CUBLASLT_MATMUL_DESC_A_SCALE_MODE, vec32)
+                || !set_i32(D::CUBLASLT_MATMUL_DESC_B_SCALE_MODE, vec32)
+                || !mx_set_scale_pointers(desc, a_scales, b_scales)
+            {
+                break 'build false;
+            }
+            if lt::cublasLtMatrixLayoutCreate(&mut adesc, e4m3, k as u64, m as u64, i64::from(k))
+                != ok
+                || lt::cublasLtMatrixLayoutCreate(
+                    &mut bdesc,
+                    e4m3,
+                    k as u64,
+                    n as u64,
+                    i64::from(k),
+                ) != ok
+                || lt::cublasLtMatrixLayoutCreate(
+                    &mut cdesc,
+                    c_type,
+                    m as u64,
+                    n as u64,
+                    i64::from(ldc),
+                ) != ok
+            {
+                break 'build false;
+            }
+            true
+        }
+    };
+    if !built {
+        // SAFETY: handles are exactly as left above.
+        unsafe { destroy_handles(desc, adesc, bdesc, cdesc) };
+        return None;
+    }
+    let mut results: [lt::cublasLtMatmulHeuristicResult_t; HEURISTIC_CANDIDATES] =
+        // SAFETY: plain-old-data out-array, read only up to `returned`.
+        unsafe { std::mem::zeroed() };
+    let mut returned: i32 = 0;
+    // SAFETY: the preference is created, set, used for one query, destroyed.
+    let query_ok = unsafe {
+        let mut pref: lt::cublasLtMatmulPreference_t = std::ptr::null_mut();
+        if lt::cublasLtMatmulPreferenceCreate(&mut pref) != ok {
+            false
+        } else {
+            use lt::cublasLtMatmulPreferenceAttributes_t as P;
+            let red_mask: u32 =
+                lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE as u32;
+            let set_u32 = |attr, v: &u32| {
+                lt::cublasLtMatmulPreferenceSetAttribute(
+                    pref,
+                    attr,
+                    v as *const u32 as *const std::ffi::c_void,
+                    4,
+                ) == ok
+            };
+            let got = lt::cublasLtMatmulPreferenceSetAttribute(
+                pref,
+                P::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &ws_bytes as *const usize as *const std::ffi::c_void,
+                std::mem::size_of::<usize>(),
+            ) == ok
+                && set_u32(P::CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &red_mask)
+                && set_u32(P::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, &align)
+                && set_u32(P::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, &align)
+                && set_u32(P::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, &align)
+                && set_u32(P::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, &align)
+                && lt::cublasLtMatmulAlgoGetHeuristic(
+                    handle,
+                    desc,
+                    adesc,
+                    bdesc,
+                    cdesc,
+                    cdesc,
+                    pref,
+                    HEURISTIC_CANDIDATES as i32,
+                    results.as_mut_ptr(),
+                    &mut returned,
+                ) == ok;
+            lt::cublasLtMatmulPreferenceDestroy(pref);
+            got
+        }
+    };
+    let candidates: Vec<Candidate> = if query_ok {
+        results[..returned.max(0) as usize]
+            .iter()
+            .filter(|r| r.state == ok && r.workspaceSize <= ws_bytes)
+            .map(|r| Candidate {
+                algo: r.algo,
+                ws: r.workspaceSize,
+                from_heuristic: true,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if candidates.is_empty() {
+        // SAFETY: live handles, abandoned.
+        unsafe { destroy_handles(desc, adesc, bdesc, cdesc) };
+        return None;
+    }
+    // Timed selection as the bf16 path: scratch D, beta = 0, never the
+    // caller's C; off under --deterministic, graph capture, or past the budget.
+    let out_bytes = (ldc as usize) * (n as usize) * 4;
+    let tune = tune_enabled()
+        && !super::graph_capture::enabled()
+        && !crate::deterministic_ops::is_deterministic()
+        && out_bytes <= TUNE_SCRATCH_CAP_BYTES
+        && tune_budget_allows(shapes_tuned());
+    let mut chosen = 0;
+    if tune && candidates.len() > 1 {
+        // SAFETY: the caller's live operands; the descriptor holds their scales.
+        if let Some((i, ms, h0)) = unsafe {
+            tune_two_rounds(
+                handle,
+                desc,
+                adesc,
+                bdesc,
+                cdesc,
+                a,
+                b,
+                out_bytes,
+                &candidates,
+            )
+        } {
+            chosen = i;
+            MX_TUNED.fetch_add(1, Ordering::Relaxed);
+            log_tune(
+                "mxfp8-lt",
+                1,
+                0,
+                m,
+                n,
+                k,
+                &candidates[i],
+                ms,
+                h0,
+                candidates.len(),
+            );
+        }
+    }
+    Some(Plan {
+        desc,
+        adesc,
+        bdesc,
+        cdesc,
+        algo: candidates[chosen].algo,
+        ws_bytes: candidates[chosen].ws,
+    })
+}
+
+/// Issue `D = alpha · A^T B + beta · C` (column-major, `[m, n]`, `ldc`) with
+/// MXFP8 operands: `a` is `m` rows of `k` E4M3 bytes, `b` is `n` rows of
+/// `k`, each with its VEC32_UE8M0 scales in cublasLt's tiled layout. `c`
+/// (bf16 or f32) is read when `beta != 0` and written in place. Returns
+/// `false` (nothing written) when cublasLt declines the shape; the caller
+/// must then compute the product another way.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn matmul_mxfp8(
+    m: i32,
+    n: i32,
+    k: i32,
+    alpha: f32,
+    a: *const std::ffi::c_void,
+    a_scales: *const std::ffi::c_void,
+    b: *const std::ffi::c_void,
+    b_scales: *const std::ffi::c_void,
+    beta: f32,
+    c: *mut std::ffi::c_void,
+    ldc: i32,
+    c_bf16: bool,
+) -> bool {
+    let decline = |why: &str| {
+        MX_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        print_fallback_once(why);
+        false
+    };
+    if m <= 0 || n <= 0 || k <= 0 || k % 32 != 0 || ldc < m {
+        return decline("mxfp8: a shape outside the block-scaled contract");
+    }
+    // cublasLt wants 16-byte operands and scale tensors. A misaligned buffer
+    // would fail at launch and poison the shape's plan for aligned callers.
+    if !((a as usize) | (b as usize) | (c as usize) | (a_scales as usize) | (b_scales as usize))
+        .is_multiple_of(16)
+    {
+        return decline("mxfp8: an operand or scale buffer not 16-byte aligned");
+    }
+    let Some(handle) = lt_handle() else {
+        MX_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    let align_log2 = ((a as usize) | (b as usize) | (c as usize) | 256).trailing_zeros();
+    let key: MxKey = (m, n, k, ldc, c_bf16, align_log2);
+    let hit = with_mx_plans(|plans| {
+        plans.get(&key).map(|p| {
+            p.as_ref()
+                .map(|p| (p.desc, p.adesc, p.bdesc, p.cdesc, p.algo, p.ws_bytes))
+        })
+    });
+    let (desc, adesc, bdesc, cdesc, algo, ws_need) = match hit {
+        Some(Some(t)) => t,
+        Some(None) => {
+            MX_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        None => {
+            // SAFETY: forwarded pointers are the caller's live operands.
+            let plan = unsafe {
+                build_mx_plan(
+                    handle, m, n, k, a, a_scales, b, b_scales, ldc, align_log2, c_bf16,
+                )
+            };
+            let tuple = plan
+                .as_ref()
+                .map(|p| (p.desc, p.adesc, p.bdesc, p.cdesc, p.algo, p.ws_bytes));
+            with_mx_plans(|plans| {
+                if let Some(old) = plans.insert(key, plan).flatten() {
+                    // SAFETY: displaced handles, never used again.
+                    unsafe { destroy_handles(old.desc, old.adesc, old.bdesc, old.cdesc) };
+                }
+            });
+            match tuple {
+                Some(t) => t,
+                None => return decline("mxfp8: no heuristic candidate for a shape"),
+            }
+        }
+    };
+    // SAFETY: the cached descriptor; this call's scales.
+    if !unsafe { mx_set_scale_pointers(desc, a_scales, b_scales) } {
+        return decline("mxfp8: scale pointer attribute refused");
+    }
+    let (ws_ptr, _) = workspace();
+    let stream = super::inner::current_stream() as lt::cudaStream_t;
+    // SAFETY: process-lifetime plan handles; the caller's live device buffers.
+    let st = unsafe {
+        lt::cublasLtMatmul(
+            handle,
+            desc,
+            &alpha as *const f32 as *const std::ffi::c_void,
+            a,
+            adesc,
+            b,
+            bdesc,
+            &beta as *const f32 as *const std::ffi::c_void,
+            c as *const std::ffi::c_void,
+            cdesc,
+            c,
+            cdesc,
+            &algo,
+            ws_ptr as *mut std::ffi::c_void,
+            ws_need,
+            stream,
+        )
+    };
+    if st != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+        let displaced = with_mx_plans(|plans| plans.insert(key, None));
+        if let Some(Some(p)) = displaced {
+            // SAFETY: just removed; no launch in flight with these handles.
+            unsafe { destroy_handles(p.desc, p.adesc, p.bdesc, p.cdesc) };
+        }
+        return decline("mxfp8: cublasLtMatmul launch failure");
+    }
+    MX_ISSUED.fetch_add(1, Ordering::Relaxed);
+    true
 }
 
 #[cfg(test)]

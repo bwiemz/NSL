@@ -28,6 +28,7 @@ pub mod lce_rows;
 pub mod lookup;
 pub mod maxpool;
 pub mod muon_batch;
+pub mod mx_quant;
 pub mod norm;
 pub mod optim;
 pub mod rmsnorm_bwd;

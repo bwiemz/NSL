@@ -38,11 +38,23 @@ pub fn lower_kir_module_to_ptx(irs: &[&KernelIR]) -> Vec<u8> {
     // targeted, so the bump is taken only when a kernel asks for it.
     // A bf16 conversion (FeatureSet::BF16_ARITHMETIC) is PTX ISA 7.8 and
     // sm_80 as well (roadmap A2 step 4).
+    // The E4M3 conversion (FeatureSet::FP8_CONVERT) is sm_89 with PTX ISA
+    // 8.1 (ptxas: 7.8 accepts it only on sm_90).
     let bf16 = has(FeatureSet::BF16_ARITHMETIC);
-    writeln!(ptx, ".version {}", if bf16 { "7.8" } else { "7.0" }).unwrap();
+    let fp8 = has(FeatureSet::FP8_CONVERT);
+    let version = if fp8 {
+        "8.1"
+    } else if bf16 {
+        "7.8"
+    } else {
+        "7.0"
+    };
+    writeln!(ptx, ".version {version}").unwrap();
     // The tensor-core ops (`ldmatrix`, `mma.sync` m16n8k16 f16) are sm_80
     // instructions as well.
-    let target = if has(FeatureSet::ASYNC_COPY) || has(FeatureSet::TENSOR_CORES) || bf16 {
+    let target = if fp8 {
+        "sm_89"
+    } else if has(FeatureSet::ASYNC_COPY) || has(FeatureSet::TENSOR_CORES) || bf16 {
         "sm_80"
     } else {
         "sm_70"
@@ -1029,6 +1041,24 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
                 hi,
                 var_reg_prefix(ir, *lo, *lo),
                 lo
+            )
+            .unwrap();
+        }
+        KirOp::PackE4m3x4 { dst, vals } => {
+            // As `CvtPack`, the first source lands in the upper half: `lo`
+            // holds vals[1]:vals[0], `hi` vals[3]:vals[2], and `mov.b32 {lo,
+            // hi}` puts `lo` in the low 16 bits. The braces scope the two
+            // `.b16` registers to this op.
+            let r = |v: VarId| format!("{}{}", var_reg_prefix(ir, v, v), v);
+            writeln!(
+                ptx,
+                "    {{ .reg .b16 lo, hi; cvt.rn.satfinite.e4m3x2.f32 lo, {}, {}; \
+                 cvt.rn.satfinite.e4m3x2.f32 hi, {}, {}; mov.b32 {}, {{lo, hi}}; }}",
+                r(vals[1]),
+                r(vals[0]),
+                r(vals[3]),
+                r(vals[2]),
+                r(*dst)
             )
             .unwrap();
         }
