@@ -374,6 +374,12 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
          run, declines, and weight images quantized against reused",
     ),
     m(
+        "[accum]",
+        &["crates/nsl-runtime/src/args.rs"],
+        "the fresh gradient accumulators at exit (NSL_ACCUM_COUNTER=1): marked fresh by the \
+         optimizer step, overwritten by a covering writer, or zeroed before an add or a read",
+    ),
+    m(
         "[weight-stream]",
         &[
             "crates/nsl-codegen/src/stmt.rs",
