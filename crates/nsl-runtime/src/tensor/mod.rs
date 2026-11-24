@@ -3514,7 +3514,17 @@ pub extern "C" fn nsl_rmsnorm_backward_fused(
             let r = NslTensor::from_ptr(res_ptr);
             r.shape_eq(x) && r.device == x.device && r.dtype == x.dtype
         };
-        if res_fits {
+        // A row the kernels' slots take, and at least one row; otherwise the two
+        // ops, without acquiring anything first.
+        let cols = if x.ndim > 0 {
+            unsafe { *x.shape.add(x.ndim as usize - 1) }
+        } else {
+            0
+        };
+        let fits = cols > 0
+            && x.len >= cols
+            && nsl_kir::kernels::rmsnorm_bwd::slots_for(cols as u64).is_some();
+        if res_fits && fits {
             // Owned refs, one unconditional free each (see nsl_rmsnorm_dx_backward).
             let dy_dev = nsl_tensor_to_device(dy_ptr, x.device as i64);
             let dy_c = nsl_tensor_contiguous(dy_dev);

@@ -696,7 +696,7 @@ pub static REGISTRY: &[EnvVar] = &[
         "on",
         Perf,
         Compile,
-        "Kill switch for computing the RMSNorm input and gain gradients in one pass over the row (needs --fuse-rmsnorm-backward; dx bit-exact, dgamma over a finer deterministic chunking)."
+        "Kill switch for computing the RMSNorm input and gain gradients in one pass over the row (needs --fuse-rmsnorm-backward)."
     ),
     var!(
         "NSL_FUSE_NORM_RESIDUAL",
