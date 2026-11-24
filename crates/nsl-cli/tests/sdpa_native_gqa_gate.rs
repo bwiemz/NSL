@@ -14,9 +14,11 @@
 //!   grouped K/V itself (`nsl_sdpa_expand_kv`, the same op chain), and the
 //!   CPU reference backward computes per query head and sums each group with
 //!   the expansion's adjoint;
-//! - on the GPU under `--deterministic`: the tensor-core forward reads
-//!   grouped K/V in place (each query head reads the same values as from the
-//!   expanded copy), and the backward is the CPU reference;
+//! - on the GPU under `--deterministic` with the CPU reference backward
+//!   (`NSL_FLASH_BWD_CPU=1`; `--deterministic` alone takes the tensor-core
+//!   backward, whose in-place group sum differs from the expanded copy's in
+//!   summation order): the tensor-core forward reads grouped K/V in place
+//!   (each query head reads the same values as from the expanded copy);
 //! - the previous attention kernels (`NSL_TC_ATTENTION=0`): the fused forward
 //!   expands grouped K/V on the device;
 //! - `NSL_SDPA_GQA_EXPAND=1` (the kill switch) with the tensor-core backward:
@@ -258,10 +260,19 @@ fn assert_tc_forward(out: &RunOutput) {
 #[ignore = "requires CUDA GPU"]
 fn on_the_gpu_grouped_kv_is_the_expanded_computation_under_deterministic() {
     // Forward on the tensor-core kernels (grouped K/V read in place),
-    // backward on the CPU reference (`--deterministic`).
-    let (g, e) = assert_identical("gpu_det", GPU);
-    assert_tc_forward(&g);
-    assert_tc_forward(&e);
+    // backward on the CPU reference, which computes per query head and sums
+    // each group as the expansion's adjoint does: bit for bit only there.
+    let envs = [("NSL_FLASH_BWD_CPU", "1")];
+    let (g, e) = assert_identical("gpu_det", Arm { envs: &envs, ..GPU });
+    for out in [&g, &e] {
+        assert_tc_forward(out);
+        assert!(
+            out.stderr
+                .contains("NSL_FLASH_BWD_CPU=1 — deterministic CPU reference backward forced"),
+            "the CPU reference backward did not run:\n{}",
+            out.stderr
+        );
+    }
 }
 
 #[test]
