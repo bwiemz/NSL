@@ -357,6 +357,34 @@ fn rmsnorm_dgamma_module(op: nsl_kir::kernels::rmsnorm_dgamma::RmsNormDgammaOp) 
     MODULES[slot].get_or_init(|| String::from_utf8(nsl_kir::kernels::rmsnorm_dgamma::ptx(op)).expect("PTX must be ASCII"))
 }
 
+/// `nsl_rmsnorm_bwd_fused[_add]_f32_s<slots>(dy, x, gamma, dxout, [res,]
+/// partial, rows, cols, eps, chunk_rows)`: the RMSNorm backward in one pass
+/// over `dy` and `x` (`nsl_kir::kernels::rmsnorm_bwd`), writing `dx` and the
+/// gamma gradient's per-chunk column sums. `(ptx, name)`, both
+/// NUL-terminated, built once per variant.
+pub(crate) fn rmsnorm_bwd_fused_module(
+    add: bool,
+    slots: u32,
+) -> (&'static str, &'static std::ffi::CStr) {
+    use nsl_kir::kernels::rmsnorm_bwd::{MAX_SLOTS, kernel_name, ptx};
+    use std::ffi::CString;
+    use std::sync::OnceLock;
+    const N: usize = 2 * MAX_SLOTS as usize;
+    static MODULES: [OnceLock<(String, CString)>; N] = [const { OnceLock::new() }; N];
+    assert!(
+        (1..=MAX_SLOTS).contains(&slots),
+        "rmsnorm_bwd: {slots} slots"
+    );
+    let at = usize::from(add) * MAX_SLOTS as usize + (slots - 1) as usize;
+    let (p, n) = MODULES[at].get_or_init(|| {
+        (
+            String::from_utf8(ptx(add, slots)).expect("PTX must be ASCII"),
+            CString::new(kernel_name(add, slots)).expect("kernel names have no NUL"),
+        )
+    });
+    (p.as_str(), n.as_c_str())
+}
+
 // P5 slice C — fused RMSNorm dx WITH residual-gradient fold: the dx kernel
 // plus one epilogue `add.rn` of a same-shape residual gradient before the
 // store — replaces the adjoint-accumulate Add that followed the dx op

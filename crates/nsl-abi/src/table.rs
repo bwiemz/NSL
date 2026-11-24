@@ -459,6 +459,8 @@ macro_rules! for_each_runtime_fn {
             [abi_tensor] nsl_rmsnorm_dx_backward_add(i64, i64, i64, i64, f64) -> i64 = tensor::nsl_rmsnorm_dx_backward_add;
             // P5 item 20 slice A: fused RMSNorm gamma-gradient (dy, x, gamma, eps) -> dgamma.
             [abi_tensor] nsl_rmsnorm_dgamma_backward(i64, i64, i64, f64) -> i64 = tensor::nsl_rmsnorm_dgamma_backward;
+            // Round 3: the RMSNorm backward in one pass (dy, x, gamma, res|0, eps) -> [dx, dgamma].
+            [abi_tensor] nsl_rmsnorm_backward_fused(i64, i64, i64, i64, f64) -> i64 = tensor::nsl_rmsnorm_backward_fused;
             // Source AD: reduce gradient to match parameter shape (matmul broadcast backward)
             [abi_tensor] nsl_tensor_reduce_to_shape(i64, i64) -> i64 = tensor::ad_ops::nsl_tensor_reduce_to_shape;
             // CCR: a one-element broadcast view with the operand's shape and device, read by
@@ -1418,6 +1420,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 689);
+        assert_eq!(RUNTIME_ABI.len(), 690);
     }
 }

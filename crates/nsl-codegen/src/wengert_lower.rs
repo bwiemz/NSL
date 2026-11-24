@@ -492,6 +492,11 @@ fn compile_wengert_ops_range_inner(
     // op that defines it.
     let swiglu_groups = swiglu_backward_groups(compiler, wengert, range.clone());
     let mut swiglu_stash: HashMap<VarId, Value> = HashMap::new();
+    // Round 3: an RMSNorm's input gradient and its gain gradient, lowered as one
+    // pass at the dx op (`norm_backward_groups`); the gain gradient waits in
+    // `norm_bwd_stash` until its op.
+    let norm_bwd_groups = norm_backward_groups(compiler, wengert, range.clone());
+    let mut norm_bwd_stash: HashMap<VarId, Value> = HashMap::new();
     // Round-2 item 6: a residual `Add` and the `RMSNorm` of its sum, lowered as one
     // launch at the Add (`add_rmsnorm_groups`). The norm's output waits in
     // `compiler.add_norm_stash` until its op. A caller that splits one list into
@@ -728,6 +733,14 @@ fn compile_wengert_ops_range_inner(
         let result_val = if let Some(v) = swiglu_stash.remove(&op.result) {
             // Computed by the grouped launch at its gate op.
             v
+        } else if let Some(v) = norm_bwd_stash.remove(&op.result) {
+            // The gain gradient of a one-pass RMSNorm backward: computed at its dx op.
+            v
+        } else if let Some(&dgamma) = norm_bwd_groups.get(&op.result) {
+            let (dx, dg) = lower_norm_backward_group(compiler, builder, op, var_map)?;
+            norm_bwd_stash.insert(dgamma, dg);
+            compiler.norm_bwd_fused += 1;
+            dx
         } else if let Some(v) = compiler.add_norm_stash.remove(&op.result) {
             // The RMSNorm of a grouped residual add: computed by the launch at its Add.
             v
@@ -919,6 +932,17 @@ fn compile_wengert_ops_range_inner(
             owned_values.push((op.result, result_val, result_type));
         }
         var_types.insert(op.result, result_type);
+    }
+    if !norm_bwd_stash.is_empty() {
+        // Both ops of every group are in this range, and a dgamma op reads only what
+        // its dx op read, so it cannot have been skipped; a value left here would be
+        // computed and never bound.
+        return Err(CodegenError::new(format!(
+            "internal: a one-pass RMSNorm backward produced gain gradient(s) {:?} whose op was \
+             not reached in the same lowering range; please report this (NSL_FUSE_NORM_DGAMMA=0 \
+             avoids it)",
+            norm_bwd_stash.keys().collect::<Vec<_>>()
+        )));
     }
     if add_norm_local && !compiler.add_norm_stash.is_empty() {
         // Every group planned in this range has both ops in it; a norm output left
@@ -1878,6 +1902,116 @@ fn passthrough_norm_eps(
         .parse()
         .map_err(|_| CodegenError::new(format!("{name}: malformed eps suffix")))?;
     Ok(builder.ins().f64const(f64::from_bits(bits)))
+}
+
+/// Round 3: the RMSNorm backward pairs of `wengert.ops[range]` that lower as one
+/// pass over the row (`nsl_rmsnorm_backward_fused`): an input-gradient op,
+/// `rmsnorm_dx_backward[_add]:<eps>(dy, x, gamma[, res][, eps])`, and a LATER
+/// `rmsnorm_dgamma_backward:<eps>(dy, x, gamma[, eps])` of the same `dy`, `x`,
+/// `gamma` and eps. Maps the dx op's result to the dgamma op's. Neither result
+/// may be planned by the storage plan (both are f32 by construction; a plan entry
+/// means another lowering owns it) or pinned by the transient arena (a pin places
+/// one allocation; the launch makes two). A pair split across two ranges lowers
+/// op by op. `NSL_FUSE_NORM_DGAMMA=0` (compile time): none.
+fn norm_backward_groups(
+    compiler: &Compiler,
+    wengert: &WengertList,
+    range: std::ops::Range<usize>,
+) -> HashMap<VarId, VarId> {
+    let mut pairs = HashMap::new();
+    if std::env::var("NSL_FUSE_NORM_DGAMMA").ok().as_deref() == Some("0") {
+        return pairs;
+    }
+    // (eps suffix, dy, x, gamma, run-time eps) of a dx op; `None` for anything else.
+    fn dx_key(op: &WengertOp) -> Option<(&str, VarId, VarId, VarId, Option<VarId>)> {
+        let PrimalOp::Passthrough(name) = &op.op else {
+            return None;
+        };
+        let (sfx, fixed) = if let Some(s) = name.strip_prefix("rmsnorm_dx_backward_add:") {
+            (s, 4)
+        } else if let Some(s) = name.strip_prefix("rmsnorm_dx_backward:") {
+            (s, 3)
+        } else {
+            return None;
+        };
+        let var = sfx == "var";
+        if op.inputs.len() != fixed + usize::from(var) {
+            return None;
+        }
+        Some((
+            sfx,
+            op.inputs[0],
+            op.inputs[1],
+            op.inputs[2],
+            var.then(|| op.inputs[fixed]),
+        ))
+    }
+    let free = |v: VarId| {
+        !compiler.storage_out.contains_key(&v) && !compiler.arena_placements.contains_key(&v)
+    };
+    let ops = &wengert.ops[range];
+    let mut taken: std::collections::HashSet<VarId> = std::collections::HashSet::new();
+    for (i, dx) in ops.iter().enumerate() {
+        let Some((sfx, dy, x, gamma, eps)) = dx_key(dx) else {
+            continue;
+        };
+        if !free(dx.result) {
+            continue;
+        }
+        let want = format!("rmsnorm_dgamma_backward:{sfx}");
+        let mut inputs = vec![dy, x, gamma];
+        inputs.extend(eps);
+        let Some(dg) = ops[i + 1..].iter().find(|g| {
+            matches!(&g.op, PrimalOp::Passthrough(n) if *n == want)
+                && g.inputs == inputs
+                && !taken.contains(&g.result)
+                && free(g.result)
+        }) else {
+            continue;
+        };
+        taken.insert(dg.result);
+        pairs.insert(dx.result, dg.result);
+    }
+    pairs
+}
+
+/// Lower a grouped RMSNorm dx op (`norm_backward_groups`) as one
+/// `nsl_rmsnorm_backward_fused` launch: `(dx, dgamma)`.
+fn lower_norm_backward_group(
+    compiler: &mut Compiler,
+    builder: &mut FunctionBuilder,
+    op: &WengertOp,
+    var_map: &VarMap,
+) -> Result<(Value, Value), CodegenError> {
+    let inputs = resolve_inputs(op, var_map)?;
+    let PrimalOp::Passthrough(name) = &op.op else {
+        return Err(CodegenError::new(
+            "internal: an RMSNorm backward group without its dx op",
+        ));
+    };
+    let (base, fixed) = if name.starts_with("rmsnorm_dx_backward_add:") {
+        ("rmsnorm_dx_backward_add:", 4)
+    } else {
+        ("rmsnorm_dx_backward:", 3)
+    };
+    let e = passthrough_norm_eps(builder, name, base, &inputs, fixed)?;
+    let res = if fixed == 4 {
+        inputs[3]
+    } else {
+        builder.ins().iconst(cl_types::I64, 0)
+    };
+    let list = call(
+        compiler,
+        builder,
+        "nsl_rmsnorm_backward_fused",
+        &[inputs[0], inputs[1], inputs[2], res, e],
+    )?;
+    let i0 = builder.ins().iconst(cl_types::I64, 0);
+    let dx = call(compiler, builder, "nsl_list_get", &[list, i0])?;
+    let i1 = builder.ins().iconst(cl_types::I64, 1);
+    let dg = call(compiler, builder, "nsl_list_get", &[list, i1])?;
+    call(compiler, builder, "nsl_list_free", &[list])?;
+    Ok((dx, dg))
 }
 
 /// The fused SwiGLU's adjoint groups of `wengert.ops[range]` that lower as

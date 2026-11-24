@@ -8658,6 +8658,19 @@ pub(crate) fn gpu_rmsnorm_dgamma_backward_f32(
     gamma_ptr: i64,
     eps: f32,
 ) -> i64 {
+    gpu_rmsnorm_dgamma_backward_f32_with(dy_ptr, x_ptr, gamma_ptr, eps, None)
+}
+
+/// [`gpu_rmsnorm_dgamma_backward_f32`] with `chunk_rows` rows a chunk in place
+/// of `dgamma_plan`'s (`None`: the plan's).
+#[cfg(feature = "cuda")]
+fn gpu_rmsnorm_dgamma_backward_f32_with(
+    dy_ptr: i64,
+    x_ptr: i64,
+    gamma_ptr: i64,
+    eps: f32,
+    chunk_rows: Option<u64>,
+) -> i64 {
     use nsl_kir::kernels::rmsnorm_dgamma::{dgamma_plan, DgammaPlan, RmsNormDgammaOp};
     inner::set_oom_context("rmsnorm_dgamma_bwd_f32");
     use crate::tensor::NslTensor;
@@ -8687,7 +8700,11 @@ pub(crate) fn gpu_rmsnorm_dgamma_backward_f32(
     );
     // Kernel 1 is a block per row: the grid's x extent caps the rows.
     assert!(rows < (1u64 << 31), "rmsnorm dgamma: {rows} rows exceed the grid");
-    let plan: DgammaPlan = dgamma_plan(rows, cols);
+    let mut plan: DgammaPlan = dgamma_plan(rows, cols);
+    if let Some(c) = chunk_rows {
+        plan.chunk_rows = c.max(1);
+        plan.chunks = rows.div_ceil(plan.chunk_rows);
+    }
 
     // Output rides gamma's shape (rank-1 [cols] in every stdlib norm).
     let out_data = inner::alloc_managed(cols as usize * 4);
@@ -8776,6 +8793,184 @@ pub(crate) fn gpu_rmsnorm_dgamma_backward_f32(
         out_data, out_shape, out_strides, g.ndim, g.len, x.device, 1, 1, 0,
     ));
     NslTensor::publish(out)
+}
+
+/// Round 3: the RMSNorm backward in one pass over `dy` and `x`. One launch of
+/// `nsl_kir::kernels::rmsnorm_bwd` writes `dx` (plus `res` when given) and the
+/// gamma gradient's per-chunk column sums, then the final pass of
+/// [`gpu_rmsnorm_dgamma_backward_f32`] adds the chunks. Same operand
+/// contracts as that function and [`gpu_rmsnorm_dx_backward_add_f32`]
+/// (contiguous f32 on one device). `dx` is bit-identical to theirs; `dgamma`
+/// is their arithmetic over the chunks of `plan` (the module documents both).
+///
+/// `None`, with nothing launched or allocated, when there are no rows or a row
+/// is wider than the kernels' register slots: the caller runs the two ops.
+/// `chunk_rows` overrides the plan (tests); production passes `None`.
+#[cfg(feature = "cuda")]
+pub(crate) fn gpu_rmsnorm_backward_fused_f32(
+    dy_ptr: i64,
+    x_ptr: i64,
+    gamma_ptr: i64,
+    res_ptr: Option<i64>,
+    eps: f32,
+    chunk_rows: Option<u64>,
+) -> Option<(i64, i64)> {
+    use crate::tensor::NslTensor;
+    use nsl_kir::kernels::rmsnorm_bwd::{FUSED_BLOCK, fused_plan, fused_plan_with, slots_for};
+    use nsl_kir::kernels::rmsnorm_dgamma::{DgammaPlan, RmsNormDgammaOp};
+
+    let x = NslTensor::from_ptr(x_ptr);
+    assert_gpu_f32(x, "rmsnorm_backward_fused_f32", "x");
+    let ndim = x.ndim as usize;
+    let shape_slice = unsafe { std::slice::from_raw_parts(x.shape, ndim) };
+    let cols = shape_slice[ndim - 1] as u64;
+    let rows = if cols == 0 { 0 } else { (x.len as u64) / cols };
+    let slots = slots_for(cols)?;
+    if rows == 0 {
+        return None;
+    }
+    let g = NslTensor::from_ptr(gamma_ptr);
+    let dy = NslTensor::from_ptr(dy_ptr);
+    assert_gpu_f32(g, "rmsnorm_backward_fused_f32", "gamma");
+    assert_gpu_f32(dy, "rmsnorm_backward_fused_f32", "dy");
+    assert_eq!(
+        g.len as u64, cols,
+        "rmsnorm backward: gamma len {} != last dim {cols}",
+        g.len
+    );
+    assert_eq!(dy.len, x.len, "rmsnorm backward: dy/x length mismatch");
+    if let Some(r) = res_ptr {
+        let r = NslTensor::from_ptr(r);
+        assert_gpu_f32(r, "rmsnorm_backward_fused_f32", "residual");
+        assert_eq!(r.len, x.len, "rmsnorm backward: residual/x length mismatch");
+    }
+    let plan = match chunk_rows {
+        Some(c) => fused_plan_with(rows, c),
+        None => fused_plan(rows),
+    };
+    // The grid's x extent caps the chunks.
+    assert!(
+        plan.chunks < (1u64 << 31),
+        "rmsnorm backward: {} chunks exceed the grid",
+        plan.chunks
+    );
+    inner::set_oom_context("rmsnorm_backward_fused_f32");
+
+    let dx_data = inner::alloc_managed(x.len as usize * 4);
+    let dx_shape = NslTensor::copy_shape(x.shape, x.ndim);
+    let dx_strides = NslTensor::compute_strides(dx_shape, x.ndim);
+    let dg_data = inner::alloc_managed(cols as usize * 4);
+    let dg_shape = NslTensor::copy_shape(g.shape, g.ndim);
+    let dg_strides = NslTensor::compute_strides(dg_shape, g.ndim);
+    let partial = inner::alloc_managed((plan.chunks * cols) as usize * 4);
+
+    let mut dy_u64 = dy.data as u64;
+    let mut x_u64 = x.data as u64;
+    let mut g_u64 = g.data as u64;
+    let mut dx_u64 = dx_data as u64;
+    let mut res_u64 = res_ptr.map_or(0, |r| NslTensor::from_ptr(r).data as u64);
+    let mut partial_u64 = partial as u64;
+    let mut dg_u64 = dg_data as u64;
+    let mut rows_val = rows;
+    let mut cols_val = cols;
+    let mut eps_val = eps;
+    let mut chunk_rows_val = plan.chunk_rows;
+    let mut chunks_val = plan.chunks;
+    let arg = |p: &mut u64| p as *mut u64 as *mut std::ffi::c_void;
+    let mut args: Vec<*mut std::ffi::c_void> = vec![
+        arg(&mut dy_u64),
+        arg(&mut x_u64),
+        arg(&mut g_u64),
+        arg(&mut dx_u64),
+    ];
+    if res_ptr.is_some() {
+        args.push(arg(&mut res_u64));
+    }
+    args.extend([
+        arg(&mut partial_u64),
+        arg(&mut rows_val),
+        arg(&mut cols_val),
+        &mut eps_val as *mut f32 as *mut std::ffi::c_void,
+        arg(&mut chunk_rows_val),
+    ]);
+    let (ptx, name) = fused_kernels::rmsnorm_bwd_fused_module(res_ptr.is_some(), slots);
+    let result = inner::kernel_launch(
+        ptx.as_ptr(),
+        name.as_ptr() as *const u8,
+        [plan.chunks as i64, 1, 1],
+        [i64::from(FUSED_BLOCK), 1, 1],
+        &args,
+        0,
+    );
+    assert_eq!(
+        result as u32, 0,
+        "GPU rmsnorm backward kernel failed: {:?}",
+        result
+    );
+
+    let final_args: [*mut std::ffi::c_void; 4] = [
+        arg(&mut partial_u64),
+        arg(&mut dg_u64),
+        arg(&mut chunks_val),
+        arg(&mut cols_val),
+    ];
+    let result = inner::kernel_launch(
+        fused_kernels::rmsnorm_dgamma_final_f32_ptx().as_ptr(),
+        c"nsl_rmsnorm_dgamma_final_f32".as_ptr().cast(),
+        [DgammaPlan::final_blocks(cols) as i64, 1, 1],
+        [i64::from(RmsNormDgammaOp::Final.block()), 1, 1],
+        &final_args,
+        0,
+    );
+    assert_eq!(
+        result as u32, 0,
+        "GPU rmsnorm dgamma final kernel failed: {:?}",
+        result
+    );
+    inner::sync_after_kernel();
+    // Stream-ordered pool free, as in `gpu_rmsnorm_dgamma_backward_f32`.
+    inner::free_managed(partial);
+
+    let dx = NslTensor::publish(Box::new(NslTensor::new(
+        dx_data, dx_shape, dx_strides, x.ndim, x.len, x.device, 1, 1, 0,
+    )));
+    let dg = NslTensor::publish(Box::new(NslTensor::new(
+        dg_data, dg_shape, dg_strides, g.ndim, g.len, x.device, 1, 1, 0,
+    )));
+    Some((dx, dg))
+}
+
+/// The fused RMSNorm backward with its chunking chosen by the caller, for the
+/// gates that compare it with the three-kernel path at that chunking and for
+/// the timing diagnostics. `res == 0`: no residual. Panics where the
+/// production entry would fall back.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub fn test_rmsnorm_backward_fused_chunked(
+    dy: i64,
+    x: i64,
+    gamma: i64,
+    res: i64,
+    eps: f32,
+    chunk_rows: u64,
+) -> (i64, i64) {
+    gpu_rmsnorm_backward_fused_f32(
+        dy,
+        x,
+        gamma,
+        (res != 0).then_some(res),
+        eps,
+        Some(chunk_rows),
+    )
+    .expect("a shape the fused RMSNorm backward takes")
+}
+
+/// The three-kernel gamma gradient with the chunking chosen by the caller
+/// (`nsl_kir::kernels::rmsnorm_dgamma`'s partial kernel takes any
+/// `chunk_rows`), the reference the fused path's `dgamma` is held to bit for
+/// bit at the same chunking.
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub fn test_rmsnorm_dgamma_chunked(dy: i64, x: i64, gamma: i64, eps: f32, chunk_rows: u64) -> i64 {
+    gpu_rmsnorm_dgamma_backward_f32_with(dy, x, gamma, eps, Some(chunk_rows))
 }
 
 #[cfg(feature = "cuda")]

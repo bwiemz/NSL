@@ -3478,6 +3478,73 @@ pub extern "C" fn nsl_rmsnorm_dgamma_backward(
     dg_ptr
 }
 
+/// Round 3 — the RMSNorm backward as one pass: `[dx, dgamma]` as an `NslList`,
+/// the values `nsl_rmsnorm_dx_backward` (`res == 0`) or
+/// `nsl_rmsnorm_dx_backward_add` (`res` the residual gradient) and
+/// `nsl_rmsnorm_dgamma_backward` return for the same operands. The caller
+/// takes both and frees the list.
+///
+/// On a device, f32 operands take one launch that reads `dy` and `x` once
+/// (`gpu_rmsnorm_backward_fused_f32`): `dx` comes out bit-identical to the dx
+/// op's; `dgamma` is the dgamma op's arithmetic over a finer row chunking, so
+/// it is deterministic and within the same documented bound but not
+/// bit-identical to it. Anything the fused kernels do not take (the CPU, a row
+/// wider than their slots, a residual of another shape, device or dtype) runs
+/// the two ops.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_rmsnorm_backward_fused(
+    dy_ptr: i64,
+    x_ptr: i64,
+    gamma_ptr: i64,
+    res_ptr: i64,
+    eps: f64,
+) -> i64 {
+    let pair = |dx: i64, dg: i64| {
+        let list = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(list, dx);
+        crate::list::nsl_list_push(list, dg);
+        list
+    };
+    #[cfg(feature = "cuda")]
+    if let x = NslTensor::from_ptr(x_ptr)
+        && x.device > 0
+        && x.dtype == DTYPE_F32
+    {
+        let res_fits = res_ptr == 0 || {
+            let r = NslTensor::from_ptr(res_ptr);
+            r.shape_eq(x) && r.device == x.device && r.dtype == x.dtype
+        };
+        if res_fits {
+            // Owned refs, one unconditional free each (see nsl_rmsnorm_dx_backward).
+            let dy_dev = nsl_tensor_to_device(dy_ptr, x.device as i64);
+            let dy_c = nsl_tensor_contiguous(dy_dev);
+            let x_c = nsl_tensor_contiguous(x_ptr);
+            let g_dev = nsl_tensor_to_device(gamma_ptr, x.device as i64);
+            let g_c = nsl_tensor_contiguous(g_dev);
+            let r_c = (res_ptr != 0).then(|| nsl_tensor_contiguous(res_ptr));
+            let fused =
+                crate::cuda::gpu_rmsnorm_backward_fused_f32(dy_c, x_c, g_c, r_c, eps as f32, None);
+            for t in [dy_dev, dy_c, x_c, g_dev, g_c] {
+                nsl_tensor_free(t);
+            }
+            if let Some(r) = r_c {
+                nsl_tensor_free(r);
+            }
+            if let Some((dx, dg)) = fused {
+                return pair(dx, dg);
+            }
+        }
+    }
+
+    let dx = if res_ptr == 0 {
+        nsl_rmsnorm_dx_backward(dy_ptr, x_ptr, gamma_ptr, eps)
+    } else {
+        nsl_rmsnorm_dx_backward_add(dy_ptr, x_ptr, gamma_ptr, res_ptr, eps)
+    };
+    let dg = nsl_rmsnorm_dgamma_backward(dy_ptr, x_ptr, gamma_ptr, eps);
+    pair(dx, dg)
+}
+
 /// P5 slice C — fused RMSNorm dx + residual-gradient fold:
 ///   out = dx(dy, x, gamma, eps) + res
 /// Replaces the adjoint-accumulate Add that followed the fused dx op.

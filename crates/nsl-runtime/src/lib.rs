@@ -168,6 +168,10 @@ pub use cuda::{test_bf16_cast_cache_reset, test_bf16_cast_cache_stats};
 pub use cuda::{test_lce_logits_probe, test_lt_matmul_reset, test_lt_matmul_stats, test_lt_matmul_tf32_stats, test_storage_copy_regional_count};
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
 pub use cuda::{test_kernel_launch_census_arm, test_kernel_launch_count};
+// Test-only re-export: the fused RMSNorm backward and the three-kernel gamma
+// gradient at a caller-chosen chunking (bit-identity gates, timing).
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub use cuda::{test_rmsnorm_backward_fused_chunked, test_rmsnorm_dgamma_chunked};
 
 // Compile-time GPU-database lookup key for nsl-codegen (None on GPU-less
 // machines / non-cuda builds — non-panicking by design).
