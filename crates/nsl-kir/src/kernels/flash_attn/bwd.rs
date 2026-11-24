@@ -71,6 +71,11 @@ pub struct BwdConfig {
     /// layout (see [`super::fwd::FwdConfig::bshd`]); `lse`, `D` and `gmax`
     /// keep theirs. The pre-pass then takes `heads` too.
     pub bshd: bool,
+    /// `.minnctapersm` of the dQ kernel: the CTAs per SM its registers must
+    /// leave room for (0: ptxas chooses). See [`BwdConfig::default_min_ctas`].
+    pub dq_min_ctas: u32,
+    /// `.minnctapersm` of the dK/dV kernel (0: ptxas chooses).
+    pub dkdv_min_ctas: u32,
 }
 
 /// Warps per CTA of the pre-pass, and rows each warp reduces.
@@ -100,7 +105,35 @@ impl BwdConfig {
             io: Storage::F32,
             lpt: false,
             bshd: false,
+            dq_min_ctas: Self::default_min_ctas(head_dim),
+            dkdv_min_ctas: Self::default_min_ctas(head_dim),
         }
+    }
+
+    /// The register bound the dQ and dK/dV kernels get by default: 3 CTAs
+    /// per SM at head_dim 64, none at 128.
+    ///
+    /// Left to itself ptxas gives the head_dim-64 dQ kernel 168 registers in
+    /// the contiguous layout but 176 in the `[b, s, h, d]` one (its row
+    /// strides are run-time values), and the dK/dV kernel 213 (allocated as
+    /// 216) in both. At 128 threads a CTA then takes 22,528 or 27,648 of an
+    /// SM's 65,536 registers, so 2 CTAs fit instead of 3 (3 x 168 x 128 =
+    /// 64,512). Bounded to 3, dQ fits in 168 registers
+    /// with a 20-byte spill and dK/dV in 168 with none. Measured on an RTX
+    /// PRO 4500 (sm_120) at Coder-1B's shape (batch 2, 32 heads, 8 KV heads,
+    /// seq 2048, causal, bf16): `[b, s, h, d]` dQ 0.48 -> 0.42 ms, dK/dV
+    /// 0.60 -> 0.57 ms in either layout; unchanged at the 500M shape. At
+    /// head_dim 128 both kernels use about 254 registers at 256 threads, and
+    /// a bound of 2 CTAs spills over 1 KB per thread.
+    /// `tc_backward_layout_times` in nsl-runtime's `attention_tc.rs` times it.
+    pub fn default_min_ctas(head_dim: u32) -> u32 {
+        if head_dim > 64 { 0 } else { 3 }
+    }
+
+    /// `_m<n>` when the dQ or dK/dV bound `n` is not the default, so a
+    /// non-default kernel is told apart in traces.
+    fn min_ctas_suffix(&self, n: u32) -> String {
+        if n == Self::default_min_ctas(self.head_dim) { String::new() } else { format!("_m{n}") }
     }
 
     pub fn supported(head_dim: u32) -> bool {
@@ -125,6 +158,18 @@ impl BwdConfig {
     /// This variant with its operands in the `[b, s, h, d]` layout.
     pub fn with_bshd(self, on: bool) -> BwdConfig {
         BwdConfig { bshd: on, ..self }
+    }
+
+    /// This variant with the dQ kernel's registers bounded so that `n` CTAs
+    /// fit on an SM (0: unbounded).
+    pub fn with_dq_min_ctas(self, n: u32) -> BwdConfig {
+        BwdConfig { dq_min_ctas: n, ..self }
+    }
+
+    /// This variant with the dK/dV kernel's registers bounded so that `n`
+    /// CTAs fit on an SM (0: unbounded).
+    pub fn with_dkdv_min_ctas(self, n: u32) -> BwdConfig {
+        BwdConfig { dkdv_min_ctas: n, ..self }
     }
 
     fn io_suffix(&self) -> &'static str {
@@ -174,13 +219,14 @@ impl BwdConfig {
 
     pub fn dq_kernel_name(&self) -> String {
         format!(
-            "nsl_flash_tc_bwd_dq_{}_w{}_n{}{}{}{}",
+            "nsl_flash_tc_bwd_dq_{}_w{}_n{}{}{}{}{}",
             self.tag(),
             self.dq_warps,
             self.dq_block_n,
             self.io_suffix(),
             self.lpt_suffix(),
-            self.bshd_suffix()
+            self.bshd_suffix(),
+            self.min_ctas_suffix(self.dq_min_ctas)
         )
     }
 
@@ -210,13 +256,14 @@ impl BwdConfig {
 
     pub fn dkdv_kernel_name(&self) -> String {
         format!(
-            "nsl_flash_tc_bwd_dkdv_{}_w{}_q{}{}{}{}",
+            "nsl_flash_tc_bwd_dkdv_{}_w{}_q{}{}{}{}{}",
             self.tag(),
             self.dkdv_warps,
             self.dkdv_block_q,
             self.io_suffix(),
             self.lpt_suffix(),
-            self.bshd_suffix()
+            self.bshd_suffix(),
+            self.min_ctas_suffix(self.dkdv_min_ctas)
         )
     }
 
@@ -378,7 +425,7 @@ pub fn build_dq(cfg: BwdConfig) -> KernelIR {
         dynamic: false,
     });
     g.b.set_workgroup_size([cfg.dq_threads(), 1, 1]);
-    g.b.set_launch_bounds(cfg.dq_threads(), None);
+    g.b.set_launch_bounds(cfg.dq_threads(), (cfg.dq_min_ctas > 0).then_some(cfg.dq_min_ctas));
 
     let entry = g.b.new_block();
     g.b.set_block(entry);
@@ -774,7 +821,7 @@ pub fn build_dkdv(cfg: BwdConfig) -> KernelIR {
 
     g.b.set_smem_layout(dkdv_layout(&cfg));
     g.b.set_workgroup_size([threads, 1, 1]);
-    g.b.set_launch_bounds(threads, None);
+    g.b.set_launch_bounds(threads, (cfg.dkdv_min_ctas > 0).then_some(cfg.dkdv_min_ctas));
 
     let entry = g.b.new_block();
     g.b.set_block(entry);
@@ -1148,6 +1195,61 @@ pub fn dkdv_ptx(cfg: BwdConfig) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes the production tensor-core attention kernels' PTX (forward,
+    /// dQ and dK/dV; both head dims, causal, bf16, heaviest first, both head
+    /// layouts) into `NSL_FLASH_BWD_PTX_DIR`, for `ptxas -v` register counts
+    /// (strip the trailing NUL first).
+    #[test]
+    #[ignore = "diagnostic: writes PTX files into NSL_FLASH_BWD_PTX_DIR"]
+    fn write_production_backward_ptx() {
+        use super::super::fwd;
+        let Ok(dir) = std::env::var("NSL_FLASH_BWD_PTX_DIR") else {
+            return;
+        };
+        for hd in BwdConfig::HEAD_DIMS {
+            for bshd in [false, true] {
+                let cfg = BwdConfig::new(hd, true).with_io(Storage::Bf16).with_lpt(true).with_bshd(bshd);
+                let f = fwd::FwdConfig::new(hd, true).with_io(Storage::Bf16).with_lpt(true).with_bshd(bshd);
+                for (name, ptx) in [
+                    (cfg.dq_kernel_name(), dq_ptx(cfg)),
+                    (cfg.dkdv_kernel_name(), dkdv_ptx(cfg)),
+                    (f.kernel_name(), fwd::ptx(f)),
+                ] {
+                    std::fs::write(format!("{dir}/{name}.ptx"), ptx).expect("write PTX");
+                }
+            }
+        }
+    }
+
+    /// head_dim 64's dQ and dK/dV kernels carry the 3-CTA register bound by
+    /// default and head_dim 128's none; the default keeps the kernel names,
+    /// and any other bound is in the name and in the PTX.
+    #[test]
+    fn the_head_dim_64_kernels_are_bounded_to_three_ctas() {
+        let text = |ptx: Vec<u8>| String::from_utf8(ptx).expect("PTX is UTF-8");
+        for io in [Storage::F32, Storage::Bf16] {
+            for bshd in [false, true] {
+                let d64 = BwdConfig::new(64, true).with_io(io).with_bshd(bshd);
+                assert_eq!((d64.dq_min_ctas, d64.dkdv_min_ctas), (3, 3));
+                assert!(text(dq_ptx(d64)).contains(".maxntid 128, 1, 1\n.minnctapersm 3\n"));
+                assert!(text(dkdv_ptx(d64)).contains(".maxntid 128, 1, 1\n.minnctapersm 3\n"));
+                assert!(!d64.dq_kernel_name().contains("_m") && !d64.dkdv_kernel_name().contains("_m"));
+
+                let free = d64.with_dq_min_ctas(0).with_dkdv_min_ctas(0);
+                assert!(!text(dq_ptx(free)).contains(".minnctapersm"));
+                assert!(!text(dkdv_ptx(free)).contains(".minnctapersm"));
+                assert!(free.dq_kernel_name().ends_with("_m0") && free.dkdv_kernel_name().ends_with("_m0"));
+                assert_ne!(free, d64, "the bound is part of the runtime's kernel cache key");
+
+                let d128 = BwdConfig::new(128, true).with_io(io).with_bshd(bshd);
+                assert_eq!((d128.dq_min_ctas, d128.dkdv_min_ctas), (0, 0));
+                assert!(!text(dq_ptx(d128)).contains(".minnctapersm"));
+                assert!(!text(dkdv_ptx(d128)).contains(".minnctapersm"));
+                assert!(!d128.dq_kernel_name().contains("_m"));
+            }
+        }
+    }
 
     #[test]
     fn every_backward_variant_verifies_and_lowers() {

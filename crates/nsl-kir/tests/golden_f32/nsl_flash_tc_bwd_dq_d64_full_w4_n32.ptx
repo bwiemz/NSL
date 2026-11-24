@@ -6,6 +6,7 @@
 
 .visible .entry nsl_flash_tc_bwd_dq_d64_full_w4_n32(.param .u64 param_q, .param .u64 param_k, .param .u64 param_v, .param .u64 param_dout, .param .u64 param_lse, .param .u64 param_dvec, .param .u64 param_dq, .param .u32 param_seq, .param .u32 param_heads, .param .u32 param_kv_heads, .param .f32 param_scale)
 .maxntid 128, 1, 1
+.minnctapersm 3
 {
     .reg .u32 %r<18>;
     .reg .u64 %rd<15>;
