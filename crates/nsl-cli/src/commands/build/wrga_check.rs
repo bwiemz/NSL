@@ -79,15 +79,17 @@ pub(crate) fn run_check_wrga_analyze(
     // Redirect the build at a temp dir we own. Pre-create it so the linker has
     // a real path to drop the .o into, and so cleanup at the end is bounded.
     let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("nsl_check");
-    let temp_dir = std::env::temp_dir().join(format!(
+    let temp_dir = match super::create_scratch_dir(&format!(
         "nsl_check_wrga_analyze_{}_{}",
         std::process::id(),
         stem
-    ));
-    if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-        nsl_log::nsl_log!(ERROR, "nsl", "nsl: --wrga-analyze: could not create temp dir: {e}");
-        return 1;
-    }
+    )) {
+        Ok(dir) => dir,
+        Err(e) => {
+            nsl_log::nsl_log!(ERROR, "nsl", "nsl: --wrga-analyze: could not create temp dir: {e}");
+            return 1;
+        }
+    };
     let temp_obj = temp_dir.join(format!("{stem}.o"));
 
     // The target / ablation overrides travel explicitly on
@@ -132,7 +134,7 @@ pub(crate) fn run_check_wrga_analyze(
     // Cleanup: our owned temp dir, plus any source-adjacent .o that the build
     // path dropped. Never delete a source-adjacent .o that ALREADY existed
     // before the call — that would be a user-data loss bug.
-    let _ = std::fs::remove_dir_all(&temp_dir);
+    super::cleanup_temp_dir(&temp_dir);
     if !source_adjacent_pre_existed && source_adjacent_obj.exists() {
         let _ = std::fs::remove_file(&source_adjacent_obj);
     }
@@ -183,15 +185,17 @@ pub(crate) fn run_check_wrga_compare(
     }
 
     let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("nsl_check");
-    let temp_dir = std::env::temp_dir().join(format!(
+    let temp_dir = match super::create_scratch_dir(&format!(
         "nsl_check_wrga_compare_{}_{}",
         std::process::id(),
         stem
-    ));
-    if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-        nsl_log::nsl_log!(ERROR, "nsl", "nsl: --wrga-compare: could not create temp dir: {e}");
-        return 1;
-    }
+    )) {
+        Ok(dir) => dir,
+        Err(e) => {
+            nsl_log::nsl_log!(ERROR, "nsl", "nsl: --wrga-compare: could not create temp dir: {e}");
+            return 1;
+        }
+    };
     let temp_obj = temp_dir.join(format!("{stem}.o"));
 
     // Shared capture slot: the build path writes the produced `WrgaPlan` here
@@ -231,7 +235,7 @@ pub(crate) fn run_check_wrga_compare(
     );
 
     // Belt-and-suspenders cleanup of artifacts. Same logic as the analyze path.
-    let _ = std::fs::remove_dir_all(&temp_dir);
+    super::cleanup_temp_dir(&temp_dir);
     if !source_adjacent_pre_existed && source_adjacent_obj.exists() {
         let _ = std::fs::remove_file(&source_adjacent_obj);
     }

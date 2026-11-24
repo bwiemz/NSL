@@ -61,6 +61,8 @@ fn async_writeback_diagnostic_reports_active() {
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
         .output()
         .expect("spawn nsl build");
+    // Nothing below reads the directory, and its executable is ~130 MB.
+    let _ = std::fs::remove_dir_all(&tmp);
     assert!(output.status.success(), "compile failed");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

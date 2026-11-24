@@ -640,12 +640,15 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.
             if prefill_workers > 1 || decode_workers > 1 {
                 // Build to a temp directory first, then spawn worker processes
-                let temp_dir =
-                    std::env::temp_dir().join(format!("nsl_disagg_{}", std::process::id()));
-                if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+                // Removed at exit on every path out (see `create_scratch_dir`).
+                let temp_dir = crate::commands::build::create_scratch_dir(&format!(
+                    "nsl_disagg_{}",
+                    std::process::id()
+                ))
+                .unwrap_or_else(|e| {
                     nsl_log::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
                     process::exit(1);
-                }
+                });
 
                 let stem = file
                     .file_stem()
@@ -745,8 +748,7 @@ pub(crate) fn dispatch(args: crate::args::RunArgs) {
                 }
 
                 // Cleanup
-                let _ = std::fs::remove_file(&binary_path);
-                let _ = std::fs::remove_dir(&temp_dir);
+                crate::commands::build::cleanup_temp_dir(&temp_dir);
 
                 std::process::exit(exit_code);
             } else if devices > 1 && std::env::var("NSL_LOCAL_RANK").is_err() {

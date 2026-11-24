@@ -63,6 +63,8 @@ fn ping(x: Tensor<[4], f32>) -> Tensor<[4], f32>:
         unsafe { library.get(b"nsl_model_destroy").unwrap() };
     unsafe { destroy(model) };
     drop(library);
+    // The library and its ~140 MB of statically linked runtime are scratch.
+    let _ = std::fs::remove_dir_all(&tmp);
 }
 /// Path to the `nsl` binary built by `cargo test --workspace`.
 ///
