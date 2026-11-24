@@ -30,6 +30,7 @@ pub mod maxpool;
 pub mod muon_batch;
 pub mod norm;
 pub mod optim;
+pub mod rmsnorm_bwd;
 pub mod rmsnorm_dgamma;
 pub mod rmsnorm_dx;
 pub mod rope;

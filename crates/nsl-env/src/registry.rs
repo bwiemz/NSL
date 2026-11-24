@@ -717,6 +717,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "Kill switch for fusing single-reader elementwise chains of the backward tape into one kernel (bit-exact by construction)."
     ),
     var!(
+        "NSL_FUSE_NORM_DGAMMA",
+        Bool,
+        "0 disables; anything else or unset = on",
+        "on",
+        Perf,
+        Compile,
+        "Kill switch for computing the RMSNorm input and gain gradients in one pass over the row (needs --fuse-rmsnorm-backward)."
+    ),
+    var!(
         "NSL_FUSE_NORM_RESIDUAL",
         Bool,
         "0 disables; anything else or unset = on",

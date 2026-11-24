@@ -254,7 +254,7 @@ fn smem(n: u32) -> SmemLayout {
 /// `v` summed over its warp by a butterfly: `v += shfl.bfly(v, d)` for `d =
 /// 16, 8, 4, 2, 1`. Every lane ends with the same bits (IEEE addition is
 /// commutative, and each lane adds the same two values at every level).
-fn warp_sum(b: &mut KirBuilder, v: VarId) -> VarId {
+pub(crate) fn warp_sum(b: &mut KirBuilder, v: VarId) -> VarId {
     let mut acc = v;
     for d in [16u32, 8, 4, 2, 1] {
         let lane = u32c(b, d);
@@ -267,7 +267,7 @@ fn warp_sum(b: &mut KirBuilder, v: VarId) -> VarId {
 
 /// The eight warp sums at `sm[w · stride + at]`, `w = 0..8`, added as
 /// `((w0 + w1) + (w2 + w3)) + ((w4 + w5) + (w6 + w7))`.
-fn tree_of_eight(b: &mut KirBuilder, sm: VarId, at: VarId, stride: u32) -> VarId {
+pub(crate) fn tree_of_eight(b: &mut KirBuilder, sm: VarId, at: VarId, stride: u32) -> VarId {
     let mut level: Vec<VarId> = (0..WARPS)
         .map(|w| {
             let off = u32c(b, w * stride);

@@ -1014,6 +1014,9 @@ pub struct Compiler<'a> {
     pub(crate) add_norm_groups: Option<HashMap<crate::wengert::VarId, crate::wengert::WengertOp>>,
     /// Grouped launches emitted for the train block being lowered: (all, forward).
     pub(crate) add_norm_fused: (usize, usize),
+    /// Round 3: one-pass RMSNorm backward launches (`wengert_lower::norm_backward_groups`)
+    /// emitted for the train block being lowered.
+    pub(crate) norm_bwd_fused: usize,
     /// The program's parameter storage (`param_dtype=` on a top-level train
     /// block, resolved before `main` for the fingerprint and the banner);
     /// `None` for f32 parameters.
@@ -1360,6 +1363,7 @@ impl<'a> Compiler<'a> {
             add_norm_stash: HashMap::new(),
             add_norm_groups: None,
             add_norm_fused: (0, 0),
+            norm_bwd_fused: 0,
             param_storage: None,
             activation_bf16: false,
             packing_meta_vars: None,
