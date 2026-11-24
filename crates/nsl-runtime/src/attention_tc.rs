@@ -251,13 +251,20 @@ pub(crate) fn backward_io(a: &BwdLaunch, io: nsl_kir::kernels::storage::Storage)
 /// [`backward_io`] with every operand in the `[batch, seq, heads, head_dim]`
 /// layout when `bshd` ([`supports_bshd`] must hold).
 pub(crate) fn backward_io_layout(a: &BwdLaunch, io: nsl_kir::kernels::storage::Storage, bshd: bool) -> CUresult {
-    let cfg = BwdConfig::new(a.head_dim as u32, a.causal).with_io(io).with_bshd(bshd);
-    let cfg = if min_ctas_enabled() { cfg } else { cfg.with_dq_min_ctas(0).with_dkdv_min_ctas(0) };
+    let cfg = backward_config(a, io, bshd, min_ctas_enabled());
     let seq = a.seq as u32;
     let lpt = lpt_enabled()
         && lpt_fits(seq.div_ceil(cfg.dq_block_m()))
         && lpt_fits(seq.div_ceil(cfg.dkdv_block_n()));
     backward_with(cfg.with_lpt(lpt), a, [true, true, true])
+}
+
+/// The backward variant [`backward_io_layout`] launches before the grid order
+/// is chosen: the default tilings and register bounds, or (`min_ctas` off,
+/// `NSL_TC_ATTN_MIN_CTAS=0`) no register bounds.
+fn backward_config(a: &BwdLaunch, io: nsl_kir::kernels::storage::Storage, bshd: bool, min_ctas: bool) -> BwdConfig {
+    let cfg = BwdConfig::new(a.head_dim as u32, a.causal).with_io(io).with_bshd(bshd);
+    if min_ctas { cfg } else { cfg.with_dq_min_ctas(0).with_dkdv_min_ctas(0) }
 }
 
 /// [`backward`] with explicit tilings, launching only the kernels `run`
@@ -516,6 +523,26 @@ pub(crate) mod tests {
         // row) and f32 accumulation.
         assert!(ro < 5e-4, "O vs f16-operand model: {ro} at {iro}");
         assert!(rl < 2e-5 * (1.0 + amp_q as f64), "lse vs f16-operand model: {rl} at {irl}");
+    }
+
+    /// The launcher keeps the default register bounds unless the kill switch
+    /// is off, and then drops both (dQ and dK/dV), at either head dim.
+    #[test]
+    fn the_min_ctas_switch_drops_both_register_bounds() {
+        use nsl_kir::kernels::storage::Storage;
+        for (head_dim, bound) in [(64, 3), (128, 0)] {
+            let a = BwdLaunch {
+                q: 0, k: 0, v: 0, o: 0, lse: 0, dout: 0, dq: 0, dk: 0, dv: 0, dvec: 0, gmax: 0,
+                batch: 2, heads: 8, kv_heads: 2, seq: 256, head_dim, scale: 0.125, causal: true,
+            };
+            for bshd in [false, true] {
+                let on = backward_config(&a, Storage::Bf16, bshd, true);
+                assert_eq!((on.dq_min_ctas, on.dkdv_min_ctas), (bound, bound));
+                let off = backward_config(&a, Storage::Bf16, bshd, false);
+                assert_eq!((off.dq_min_ctas, off.dkdv_min_ctas), (0, 0));
+                assert_eq!(off, on.with_dq_min_ctas(0).with_dkdv_min_ctas(0), "only the bounds differ");
+            }
+        }
     }
 
     fn gpu() -> bool {
