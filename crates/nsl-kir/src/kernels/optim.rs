@@ -299,7 +299,12 @@ pub const FASE_ADAMW_MULTI_NAME: &str = "nsl_fase_fused_adamw_multi_f32";
 /// join(g): the single-parameter body; wd branch; θ[e] stored; mp[e] = 0
 /// ```
 pub fn build_fase_adamw_multi() -> KernelIR {
-    build_multi(FASE_ADAMW_MULTI_NAME, FirstMoment::F32, Theta::F32)
+    build_multi(
+        FASE_ADAMW_MULTI_NAME,
+        FirstMoment::F32,
+        Theta::F32,
+        MpTail::Zero,
+    )
 }
 
 /// The multi-tensor step with a bf16 first moment.
@@ -311,7 +316,12 @@ pub const FASE_ADAMW_MULTI_MBF16_NAME: &str = "nsl_fase_fused_adamw_multi_f32_mb
 /// [`build_fase_adamw_step_mbf16`]'s body with the multi kernel's
 /// `mp_scale` fold and `mp` zeroing.
 pub fn build_fase_adamw_multi_mbf16() -> KernelIR {
-    build_multi(FASE_ADAMW_MULTI_MBF16_NAME, FirstMoment::Bf16, Theta::F32)
+    build_multi(
+        FASE_ADAMW_MULTI_MBF16_NAME,
+        FirstMoment::Bf16,
+        Theta::F32,
+        MpTail::Zero,
+    )
 }
 
 /// How a bf16 parameter's master-mode image is rounded from the f32 master.
@@ -420,7 +430,52 @@ pub fn build_param_multi(theta: Theta, m_bf16: bool) -> KernelIR {
     } else {
         FirstMoment::F32
     };
-    build_multi(multi_name(theta, m_bf16), fm, theta)
+    build_multi(multi_name(theta, m_bf16), fm, theta, MpTail::Zero)
+}
+
+/// What a multi-tensor AdamW kernel leaves in the accumulated gradient `mp`
+/// once it has read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MpTail {
+    /// `mp[e] = 0`: the next window adds onto zeros. Every kernel above.
+    Zero,
+    /// `mp` is left as it is. The runtime marks the buffers fresh instead
+    /// (`nsl-runtime`'s `accum_fresh`), and the next window's first write to
+    /// each one overwrites it, so the 4-byte store per element and the first
+    /// micro-batch's read of the zeros both go.
+    Keep,
+}
+
+/// The entry name of a multi-tensor step: [`multi_name`], with `_keepmp`
+/// appended for [`MpTail::Keep`].
+pub fn multi_kernel_name(theta: Theta, m_bf16: bool, tail: MpTail) -> String {
+    match tail {
+        MpTail::Zero => multi_name(theta, m_bf16).to_string(),
+        MpTail::Keep => format!("{}_keepmp", multi_name(theta, m_bf16)),
+    }
+}
+
+/// The multi-tensor step for a parameter storage, a first-moment dtype and an
+/// accumulator tail. With [`MpTail::Zero`] it is [`build_param_multi`] (and,
+/// for [`Theta::F32`], [`build_fase_adamw_multi`] /
+/// [`build_fase_adamw_multi_mbf16`]); [`MpTail::Keep`] drops the final store
+/// and nothing else.
+pub fn build_multi_kernel(theta: Theta, m_bf16: bool, tail: MpTail) -> KernelIR {
+    let fm = if m_bf16 {
+        FirstMoment::Bf16
+    } else {
+        FirstMoment::F32
+    };
+    build_multi(&multi_kernel_name(theta, m_bf16, tail), fm, theta, tail)
+}
+
+/// [`build_multi_kernel`], lowered to a NUL-terminated PTX module.
+///
+/// # Panics
+///
+/// If the built kernel fails verification: a bug in this module.
+pub fn multi_kernel_ptx(theta: Theta, m_bf16: bool, tail: MpTail) -> Vec<u8> {
+    verified_ptx(build_multi_kernel(theta, m_bf16, tail))
 }
 
 /// [`build_param_multi`], lowered to a NUL-terminated PTX module.
@@ -502,7 +557,7 @@ fn split_hi_kir(b: &mut KirBuilder, bits: VarId) -> VarId {
     hi
 }
 
-fn build_multi(name: &str, first_moment: FirstMoment, theta_mode: Theta) -> KernelIR {
+fn build_multi(name: &str, first_moment: FirstMoment, theta_mode: Theta, tail: MpTail) -> KernelIR {
     use AddressSpace::Global;
     let mut b = KirBuilder::new(name);
     let table =
@@ -602,10 +657,19 @@ fn build_multi(name: &str, first_moment: FirstMoment, theta_mode: Theta) -> Kern
         }
         (_, None) => unreachable!("a master-carrying variant has wtab"),
     }
-    // The accumulated gradient is consumed: zero it (was a separate launch).
-    let fzero = b.new_typed_var(KirType::F32);
-    b.emit(KirOp::Const(fzero, KirConst { ty: KirType::F32, value: ConstValue::F32(0.0) }));
-    store_f32(&mut b, mp, i, fzero);
+    // The accumulated gradient is consumed: zero it (was a separate launch),
+    // unless the caller marks the buffers fresh instead (`MpTail::Keep`).
+    if tail == MpTail::Zero {
+        let fzero = b.new_typed_var(KirType::F32);
+        b.emit(KirOp::Const(
+            fzero,
+            KirConst {
+                ty: KirType::F32,
+                value: ConstValue::F32(0.0),
+            },
+        ));
+        store_f32(&mut b, mp, i, fzero);
+    }
     finish(b, exit)
 }
 
@@ -1078,6 +1142,62 @@ mod tests {
         assert_eq!(ptx.matches("add.rn.f32").count(), 5, "{ptx}");
         assert!(!ptx.contains("fma") && !ptx.contains("div.rn"), "{ptx}");
         assert!(!ptx.contains("%ntid"), "the element is bbtab[b] + tid: {ptx}");
+    }
+
+    /// The keep-mp tail drops the zero store and nothing else: for every
+    /// storage and first moment, the kernel is its zeroing twin's PTX with
+    /// one `mov.f32 0f00000000` + its address arithmetic + one f32 store
+    /// fewer, under a distinct `_keepmp` name; the zeroing kernels' names and
+    /// PTX are unchanged.
+    #[test]
+    fn the_keep_tail_drops_only_the_zero_store() {
+        let mut names = std::collections::HashSet::new();
+        for theta in std::iter::once(Theta::F32).chain(Theta::BF16) {
+            for m_bf16 in [false, true] {
+                let zero =
+                    String::from_utf8(multi_kernel_ptx(theta, m_bf16, MpTail::Zero)).unwrap();
+                assert_eq!(zero.as_bytes(), param_multi_ptx(theta, m_bf16).as_slice());
+                assert_eq!(
+                    multi_kernel_name(theta, m_bf16, MpTail::Zero),
+                    multi_name(theta, m_bf16)
+                );
+                let ir = build_multi_kernel(theta, m_bf16, MpTail::Keep);
+                crate::kir_verify::verify(&ir)
+                    .unwrap_or_else(|e| panic!("{theta:?}/{m_bf16}: {e:?}"));
+                let name = multi_kernel_name(theta, m_bf16, MpTail::Keep);
+                assert_eq!(ir.name, name);
+                assert!(
+                    name.ends_with("_keepmp") && names.insert(name.clone()),
+                    "{name}"
+                );
+                let keep =
+                    String::from_utf8(multi_kernel_ptx(theta, m_bf16, MpTail::Keep)).unwrap();
+                assert!(keep.contains(&format!(".visible .entry {name}(")), "{keep}");
+                assert_eq!(
+                    keep.matches("st.global.f32 ").count() + 1,
+                    zero.matches("st.global.f32 ").count(),
+                    "{theta:?}/{m_bf16}"
+                );
+                assert_eq!(
+                    keep.matches("0f00000000").count() + 1,
+                    zero.matches("0f00000000").count(),
+                    "{theta:?}/{m_bf16}"
+                );
+                for op in [
+                    "mul.rn.f32",
+                    "add.rn.f32",
+                    "div.approx.f32",
+                    "sqrt.rn.f32",
+                    "ld.global",
+                ] {
+                    assert_eq!(
+                        keep.matches(op).count(),
+                        zero.matches(op).count(),
+                        "{theta:?}/{m_bf16} {op}"
+                    );
+                }
+            }
+        }
     }
 
     /// The f32 members of the family are today's kernels: the same names,

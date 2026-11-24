@@ -873,6 +873,15 @@ macro_rules! for_each_runtime_fn {
             // this list, the emission order in `stmt.rs`, and the Rust signature in
             // `fase_step.rs` must stay in lockstep or arguments silently shift.
             [optimizer] nsl_fase_fused_adamw_step_multi(i64, i64, i64, i64, f64, f64, f64, f64, f64, f64, f64, f64, f64, i64, i64, f64) -> () = fase_step::nsl_fase_fused_adamw_step_multi;
+            // The same step leaving the accumulators in place for `accum_fresh` to
+            // mark: the next window's first writes overwrite them. Same arguments.
+            [optimizer] nsl_fase_fused_adamw_step_multi_keep_mp(i64, i64, i64, i64, f64, f64, f64, f64, f64, f64, f64, f64, f64, i64, i64, f64) -> () = fase_step::nsl_fase_fused_adamw_step_multi_keep_mp;
+            // Accumulators that are logically zero (`accum_fresh`): mark a list
+            // after the keep-mp step, zero what is still fresh before the buffers
+            // are read as gradients, drop the marks before they are freed.
+            [optimizer] nsl_accum_mark_fresh(i64) -> () = accum_fresh::nsl_accum_mark_fresh;
+            [optimizer] nsl_accum_materialize(i64) -> () = accum_fresh::nsl_accum_materialize;
+            [optimizer] nsl_accum_forget(i64) -> () = accum_fresh::nsl_accum_forget;
             // bf16 parameter storage on the normal schedule (`param_dtype=`): compiled `main`
             // declares the mode (banner); the train step stores its selected parameters
             // (param list, index list, mode; idempotent, emitted per micro-step) and its
@@ -1418,6 +1427,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 689);
+        assert_eq!(RUNTIME_ABI.len(), 693);
     }
 }

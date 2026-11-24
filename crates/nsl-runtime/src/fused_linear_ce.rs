@@ -1406,6 +1406,9 @@ pub extern "C" fn nsl_fused_linear_ce_backward_gemm_acc(
             ),
         );
     }
+    // The weight gradient is added per vocabulary chunk: a fresh accumulator
+    // (`crate::accum_fresh`) is zeroed first.
+    crate::accum_fresh::materialize(dw_acc);
     let rc = backward_gemm(
         grad_output_bits,
         x_ptr,
@@ -1490,6 +1493,9 @@ pub extern "C" fn nsl_fused_linear_ce_forward_gemm_grad(
         let rows = (b * s) as u64;
         // The backward's convention (`backward_gemm`).
         let scale = grad / (num_valid.max(1) as f32);
+        // A fresh accumulator (`crate::accum_fresh`) is zero in value: the
+        // head's first weight-gradient GEMM overwrites it.
+        let dw_fresh = crate::accum_fresh::claim(dw_acc);
         let (rc, route) = crate::cuda::fused_ce_kernels::gemm_forward_grad(
             x_ptr as u64,
             w_ptr as u64,
@@ -1502,6 +1508,7 @@ pub extern "C" fn nsl_fused_linear_ce_forward_gemm_grad(
             h as u64,
             scale,
             dw_alpha,
+            dw_fresh,
         );
         if rc != 0 {
             crate::fatal::die(

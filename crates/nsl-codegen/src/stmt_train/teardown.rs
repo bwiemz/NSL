@@ -136,6 +136,13 @@ pub(crate) fn emit_train_teardown(
     if let Some(accum) = accum_list.filter(|_| csla_active) {
         c.compile_call_by_name(builder, "nsl_list_free", &[accum])?;
     } else if let Some(accum) = accum_list {
+        // Drop the fresh marks (`nsl_runtime::accum_fresh`) before the
+        // buffers go back to the allocator, which may hand their addresses
+        // to tensors that are not accumulators.
+        if c.accum_keep_mp {
+            c.compile_call_by_name(builder, "nsl_accum_forget", &[accum])?;
+            c.accum_keep_mp = false;
+        }
         let fa_i_var = builder.declare_var(cl_types::I64);
         let fa_z = builder.ins().iconst(cl_types::I64, 0);
         builder.def_var(fa_i_var, fa_z);

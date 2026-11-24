@@ -432,6 +432,33 @@ pub(crate) fn fase_param_multi_ptx(
     })
 }
 
+/// The keep-mp members of the multi-tensor AdamW family
+/// (`nsl_kir::kernels::optim::MpTail::Keep`): each zeroing kernel without its
+/// final `mp = 0` store, for accumulators `crate::accum_fresh` marks fresh
+/// instead. One module per (parameter storage, first-moment dtype), f32
+/// parameters included. Returns the NUL-terminated PTX and entry name.
+pub(crate) fn fase_multi_keep_mp_ptx(
+    theta: nsl_kir::kernels::optim::Theta,
+    m_bf16: bool,
+) -> &'static (String, String) {
+    use nsl_kir::kernels::optim::{MpTail, Theta, multi_kernel_name, multi_kernel_ptx};
+    const THETAS: usize = 1 + Theta::BF16.len();
+    static MODULES: [std::sync::OnceLock<(String, String)>; 2 * THETAS] =
+        [const { std::sync::OnceLock::new() }; 2 * THETAS];
+    let at = std::iter::once(Theta::F32)
+        .chain(Theta::BF16)
+        .position(|t| t == theta)
+        .expect("a parameter storage of the multi-tensor family");
+    MODULES[2 * at + usize::from(m_bf16)].get_or_init(|| {
+        let ptx = String::from_utf8(multi_kernel_ptx(theta, m_bf16, MpTail::Keep))
+            .expect("PTX must be ASCII");
+        (
+            ptx,
+            format!("{}\0", multi_kernel_name(theta, m_bf16, MpTail::Keep)),
+        )
+    })
+}
+
 /// The split master's conversion (`nsl_kir::kernels::optim::build_param_split`).
 /// NUL-terminated.
 pub(crate) fn param_split_ptx() -> &'static str {

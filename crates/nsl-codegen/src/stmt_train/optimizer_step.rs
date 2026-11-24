@@ -409,6 +409,24 @@ impl Compiler<'_> {
                     )));
                 }
 
+                // Fresh accumulators (`nsl_runtime::accum_fresh`): the multi
+                // step leaves the buffers in place and marks them, and the next
+                // window's first writes overwrite them. Before anything here
+                // reads them (the clip's sum of squares, the step), whatever is
+                // still marked, a parameter no gradient reached this window, is
+                // zeroed, so every reader sees what the zeroing step gave.
+                // The block's own hook status, not `fase_hook_active`: the
+                // trailing-window flush re-enters here with that flag set (its
+                // gradients are already in the buffers) for any block, and must
+                // take the same decision as the block's steps.
+                let block_hook = fase_deferred && self.features.source_ad_enabled;
+                let keep_mp = multi_scalars.is_some()
+                    && self.accum_keep_mp_admitted(block_hook, csla_active, zero_enabled);
+                self.accum_keep_mp = keep_mp;
+                if keep_mp {
+                    self.compile_call_by_name(builder, "nsl_accum_materialize", &[accum])?;
+                }
+
                 if fase_plan.two_phase_clip {
                     // Phase A batching: ONE `nsl_fase_sum_sq_list` call (a
                     // single pipeline drain) instead of one synchronously
@@ -544,6 +562,7 @@ impl Compiler<'_> {
                             // mp_scale: the clip factor, folded into the
                             // m_partial read in-kernel.
                             clip_factor,
+                            keep_mp,
                         )?;
                     } else {
                     // ── Phase B: scale m_partial in place, then fused optimizer step ──
@@ -705,6 +724,7 @@ impl Compiler<'_> {
                             // param exactly as before.
                             (exempt_list_v, exempt_nr2_v),
                             one_scale,
+                            keep_mp,
                         )?;
                     } else {
                     let fs_i_var = builder.declare_var(cl_types::I64);
@@ -1156,6 +1176,42 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// Whether this train block's multi-tensor AdamW step may leave its
+    /// accumulators in place and mark them fresh (`nsl_runtime::accum_fresh`)
+    /// instead of zeroing them. The protocol is only as sound as its writers:
+    /// every write into a buffer must take its mark, and every read before
+    /// the step must come after `nsl_accum_materialize`. So it is admitted
+    /// only where the writers are the ones that do:
+    ///
+    /// - the source-AD FASE hook (`fase_hook_active`): the fused weight
+    ///   gradient, the scaled add of a materialised gradient, the tied
+    ///   embedding's scatter and the LM head's in-place weight gradient;
+    /// - not the layer-major window (`csla_active`), which allocates and
+    ///   frees its accumulators per group;
+    /// - not ZeRO, whose reduction reads the buffers before the step and
+    ///   whose non-owners zero them outside it;
+    /// - not optimizer-state offload, whose accumulators live on the host
+    ///   and are written by copies;
+    /// - not CUDA graphs, where a captured GEMM would replay its first beta;
+    /// - not `--grad-integrity`, which observes gradients the fused writers
+    ///   never materialise (they refuse it already).
+    ///
+    /// `NSL_ACCUM_OVERWRITE=0` (compile time) keeps the zeroing step.
+    pub(crate) fn accum_keep_mp_admitted(
+        &self,
+        fase_hook_active: bool,
+        csla_active: bool,
+        zero_enabled: bool,
+    ) -> bool {
+        fase_hook_active
+            && !csla_active
+            && !zero_enabled
+            && !self.compile_options.train.optim_state_offload
+            && !self.compile_options.train.cuda_graphs
+            && !self.compile_options.diagnostics.grad_integrity
+            && std::env::var("NSL_ACCUM_OVERWRITE").ok().as_deref() != Some("0")
+    }
+
     /// Step once more, after the epoch loop, on a trailing partial
     /// accumulation window.
     ///
@@ -1240,6 +1296,11 @@ impl Compiler<'_> {
                 )?;
             }
             Some(accum) => {
+                // The rescale reads every buffer: zero the ones still fresh
+                // (`nsl_runtime::accum_fresh`) first.
+                if self.accum_keep_mp {
+                    self.compile_call_by_name(builder, "nsl_accum_materialize", &[accum])?;
+                }
                 // sum(g)/N  ->  sum(g)/k.
                 let window_f = builder.ins().f64const(window as f64);
                 let pending_f = builder.ins().fcvt_from_sint(cl_types::F64, pending);

@@ -1139,6 +1139,7 @@ mod tests {
                         sc.has_wd,
                         mp_scale,
                         m_bf16,
+                        false,
                     );
                     // Candidate: the variant's launch.
                     let c: Vec<[u64; 5]> = ps
@@ -1193,6 +1194,7 @@ mod tests {
                         sc,
                         mp_scale,
                         key,
+                        false,
                     );
                     let label =
                         format!("{theta:?} m_bf16={m_bf16} wd={has_wd} mp_scale={mp_scale}");

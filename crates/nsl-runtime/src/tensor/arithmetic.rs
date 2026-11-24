@@ -1156,6 +1156,9 @@ pub extern "C" fn nsl_tensor_sub_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_scalar_mul_add_inplace(m_ptr: i64, g_ptr: i64, s: f64) {
     super::require_same_dtype("nsl_tensor_scalar_mul_add_inplace", m_ptr, g_ptr);
+    // A fresh accumulator (`crate::accum_fresh`) is zeroed before the add,
+    // so `m + t` sees the zeros the optimizer step used to store.
+    crate::accum_fresh::materialize(m_ptr);
     let m = NslTensor::from_ptr_ref(m_ptr);
     let g = NslTensor::from_ptr_ref(g_ptr);
     if m.device == g.device
