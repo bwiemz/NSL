@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+<!-- perf round 2 (2026-11-23): register bounds for the head_dim-64 tensor-core attention backward, on top of the [b, s, h, d] layout below. -->
+- **The head_dim-64 tensor-core attention backward keeps 3 CTAs per SM.**
+  - The dQ and dK/dV kernels carry `.minnctapersm 3`. Left to itself, ptxas gave the `[b, s, h, d]` dQ kernel 176 registers (its row strides are run-time values) and dK/dV 213 in either layout. At 128 threads per CTA that leaves room for 2 CTAs per SM instead of 3. Bounded, dQ fits in 168 registers with a 20-byte spill, and dK/dV fits in 168 with none. Head dim 128 stays unbounded: its kernels use about 254 registers on 256 threads.
+  - Register allocation does not change the arithmetic. The bounded kernels give the unbounded ones' bits (`the_register_bound_gives_the_same_bits`), and a 50M model's 12 updates under `--deterministic` give byte-identical checkpoints. `NSL_TC_ATTN_MIN_CTAS=0` restores ptxas's own allocation.
+  - GPU time per call in the training step (nsys, `tools/perfcheck` arm `nsl_bf16s`, 15 updates):
+    - Coder-1B: dQ 472.7 µs instead of 554.7 and dK/dV 687.9 instead of 699.7, 9.6 ms less per update (about 0.9%).
+    - Coder-500M: dQ 80.3 instead of 94.0 and dK/dV 109.9 instead of 111.6, 4.7 ms less per update.
+  - This closes the `[b, s, h, d]` dQ kernel's regression against the contiguous one (497 against 406 µs per call when the layout landed). The tok/s difference is below what an interleaved perfcheck campaign on a shared machine resolved: 0.991x [0.871-1.002] at 1B and 1.003x [0.988-1.025] at 500M over 5 rounds, with four runs rerun because other processes shared the GPU.
+
 <!-- perf round 2 (2026-11-23): the attention head layout [b, s, h, d] kept from the projections through RoPE and the tensor-core attention, measured with tools/perfcheck against main b551f3e7. -->
 - **The attention head layout `[b, s, h, d]` without transpose copies.**
   - The q/k/v projections write `[b, s, h·d]`, and `nsl.nn.gqa`'s head views `x.reshape([b, s, h, d]).transpose(1, 2)` are that buffer read through strides. RoPE now keeps its input's dense layout (a dense-rows KIR kernel moving 16-byte vectors, the same arithmetic bit for bit), the tensor-core attention forward, pre-pass, dQ and dK/dV kernels read and write `[b, s, h, d]` operands (Q, K, V, O, dO, dQ, dK, dV; the same arithmetic at other addresses, so the same bits), and `GroupedQueryAttention.forward` passes V's head view without a contiguous copy. The head views reach the attention, its output goes into the output projection (`out.transpose(1, 2).reshape(..)` is a view), and dO, dQ, dK, dV go back into the projections' GEMMs with no transpose copy. Before, RoPE wrote contiguous `[b, h, s, d]`, V was copied, and the output, dO and each gradient were transposed by copies.
