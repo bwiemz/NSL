@@ -113,6 +113,9 @@ pub const PASS_ORDER: &[TrainPassDecl] = &[
     step("CcrPlanPass", &["CCR"], Tape, "stmt_train/plan_ccr.rs", "fork_wrga_and_plan_ccr"),
     step("AdjointGenPass", &[], Adjoint, "source_ad.rs", "AdjointGenerator::new"),
     step("AdjointTapeOptPass", &[], Adjoint, "stmt_train/adjoint_tape_opt.rs", "optimize_adjoint_tape"),
+    // The fused LM heads whose gradient the forward computes; rewrites the
+    // planned extracts before CCR's splice reads the adjoint.
+    step("LceGifPlanPass", &[], Adjoint, "stmt_train/lce_gif.rs", "plan_lce_grad_in_forward"),
     step("CcrAdjointFreesPass", &[], Adjoint, "stmt_train/ccr_adjoint_frees.rs", "insert_ccr_adjoint_frees"),
     // `precision="bf16"`: plans over the final lists (clones spliced, frees
     // placed, the fused weight-gradient chains fixed), before the memory

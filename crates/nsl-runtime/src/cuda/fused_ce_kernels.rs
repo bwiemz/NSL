@@ -620,6 +620,9 @@ pub(crate) fn gemm_forward(
 /// `dw` is the weight's accumulation buffer (a tied embedding's gradient
 /// accumulated in place, no zeroed scratch and no separate add).
 ///
+/// `dx_dev == 0` skips the dx GEMMs (a caller whose x gradient nothing
+/// reads); every existing caller passes a buffer.
+///
 /// PRECONDITION (unenforceable here): as `gemm_forward` — every pointer is a
 /// bare device address and every buffer is sized at 4 bytes per element, so
 /// f32 storage is required and cannot be checked from this frame.
@@ -734,6 +737,7 @@ pub(crate) fn gemm_backward(
         }
         // dx += dlogits_chunk @ W_chunk       [rows, h]
         let gemm = match (&head, head_w) {
+            _ if dx_dev == 0 => Ok(()),
             (Some(hd), Some((w16c, _))) if hd.dx => {
                 // SAFETY: buffers sized by the shapes above.
                 unsafe {
@@ -803,4 +807,345 @@ pub(crate) fn gemm_backward(
         chunk_start += cols;
     }
     free_all(0)
+}
+
+// ─── The head's gradient in its forward (row-chunked) ───────────────────────
+//
+// A training step whose loss is the fused head's own output knows, when the
+// forward runs, the upstream gradient the backward will hand the head (the
+// loss seed, 1; the compiler proves it and the backward checks it). The
+// forward can then finish the head's whole backward while its logits are at
+// hand, instead of the backward recomputing every logits chunk:
+//
+//   for each chunk of R token rows:
+//     logits[R, V] = x_rows @ W^T            bf16 out, f32 accumulate (one GEMM)
+//     nsl_lce_rows_grad_bf16                 per-row loss; dlogits·scale in place
+//     dx_rows      = dlogits @ W             f32 out (one GEMM, K = V)
+//     dW          += dw_alpha · dlogits^T x  f32 accumulate, beta 1 (K = R)
+//
+// Three GEMM passes over the head instead of four, no f32 dlogits and no
+// cast of them, and full-width GEMMs instead of 4,096-column ones. The
+// logits scratch is `R · V` bf16 (96 MiB), so the whole batch's logits are
+// still never held.
+//
+// It needs the BF16 math mode and the head weight's persistent bf16 image
+// (the cast cache, warm from the first optimizer step on). Without either it
+// runs the vocabulary-chunked route both halves of the old path use (the
+// forward's online softmax for the LSE, then the backward's recompute with
+// the gradients), so the step's arithmetic is the old path's.
+
+/// Bytes of the row-chunked route's bf16 logits scratch: 1,024 rows at a
+/// 49,152-token vocabulary.
+#[cfg(feature = "cuda")]
+const LCE_ROW_CHUNK_BYTES: u64 = 96 << 20;
+
+/// Which route [`gemm_forward_grad`] took.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GradRoute {
+    /// Row chunks over the whole vocabulary, bf16 logits.
+    RowChunked,
+    /// The vocabulary-chunked forward, then its backward, both here.
+    VocabChunked,
+}
+
+/// The row-chunked route's bf16 operands: `x` rounded once (owned), and the
+/// head weight's image in the cast cache (borrowed).
+#[cfg(feature = "cuda")]
+struct RowHead {
+    x16: u64,
+    w16: u64,
+}
+
+#[cfg(feature = "cuda")]
+impl RowHead {
+    /// `None` (take the vocabulary-chunked route) outside the BF16 math mode,
+    /// under graph capture (`gemm16` refuses it), or while the weight has no
+    /// bf16 image (a full-`W` cast scratch would be `V · H` bf16, 192 MiB at
+    /// Coder-1B, at the forward's activation peak).
+    ///
+    /// Unlike [`Bf16Head`] it does not ask `bf16_gate` per GEMM: that gate
+    /// weighs a GEMM's bf16 saving against casting both operands for it, and
+    /// here no GEMM casts an operand (`x` is rounded once per call, `W` is the
+    /// cached image, the dlogits are written bf16 by the softmax kernel). So
+    /// all three GEMMs run on bf16 operands in the BF16 mode, at every shape,
+    /// and the logits are stored bf16 (as PyTorch autocast stores them); the
+    /// vocabulary-chunked route keeps them f32.
+    fn new(x_dev: u64, w_dev: u64, rows: u64, v: u64, h: u64) -> Option<RowHead> {
+        use crate::cuda::cublas_inner::{CublasMathMode, resolved_math_mode};
+        if resolved_math_mode() != CublasMathMode::Bf16 || crate::cuda::graph_capture::enabled() {
+            return None;
+        }
+        // The cast follows the probe at once (the cache's protocol: a
+        // `needs_cast` hand-off has already marked the image valid).
+        let (w16, needs_cast) = crate::cuda::bf16_cast_cache::acquire(w_dev, (v * h) as usize)?;
+        if needs_cast {
+            crate::cuda::gpu_cast_raw_f32_to_bf16(w_dev, w16, (v * h) as usize);
+        }
+        let x16 = crate::cuda::inner::alloc_managed((rows * h * 2) as usize) as u64;
+        crate::cuda::gpu_cast_raw_f32_to_bf16(x_dev, x16, (rows * h) as usize);
+        Some(RowHead { x16, w16 })
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for RowHead {
+    fn drop(&mut self) {
+        crate::cuda::inner::free_managed(self.x16 as *mut c_void);
+    }
+}
+
+/// `NSL_LCE_ROW_CHUNK` (rows, read once): overrides the row chunk the byte
+/// budget picks; 0 or unset keeps the budget's.
+#[cfg(feature = "cuda")]
+fn row_chunk_override() -> u64 {
+    use std::sync::OnceLock;
+    static ROWS: OnceLock<u64> = OnceLock::new();
+    *ROWS.get_or_init(|| {
+        std::env::var("NSL_LCE_ROW_CHUNK")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Rows per chunk: the bf16 logits of a chunk fit [`LCE_ROW_CHUNK_BYTES`]
+/// (a multiple of 64 from 128 rows up), or `NSL_LCE_ROW_CHUNK`.
+#[cfg(feature = "cuda")]
+fn row_chunk(rows: u64, v: u64) -> u64 {
+    let pick = match row_chunk_override() {
+        0 => {
+            let r = (LCE_ROW_CHUNK_BYTES / (v * 2)).max(1);
+            if r >= 128 { r / 64 * 64 } else { r }
+        }
+        n => n,
+    };
+    pick.clamp(1, rows)
+}
+
+/// `logits[r, v] = x16[r0.., :] @ W16^T`, the f32 accumulator rounded to
+/// bf16 once. cublasLt writes the bf16 logits itself. Where it does not take
+/// the shape (under `--deterministic` without `--bf16-lt`, or a declined
+/// plan), `gemm16` would write an f32 scratch of the whole chunk and cast it,
+/// three times the logits budget; the product then runs in row blocks whose
+/// f32 scratch fits half the budget.
+#[cfg(feature = "cuda")]
+fn logits_gemm(head: &RowHead, logits: u64, r0: u64, r: u64, v: u64, h: u64) {
+    use crate::cuda::lt_matmul;
+    let x16r = head.x16 + r0 * h * 2;
+    crate::cuda::inner::ensure_context();
+    let lt = lt_matmul::enabled() || lt_matmul::timed_lt_applies(v, r, h);
+    // SAFETY (both arms): column-major views of row-major buffers sized by
+    // the shapes (the logits scratch holds at least `r` rows of `v`), as
+    // `gemm_backward`'s bf16 head maps them.
+    if lt
+        && unsafe {
+            lt_matmul::matmul_bf16(
+                1,
+                0,
+                v as i32,
+                r as i32,
+                h as i32,
+                &1.0,
+                head.w16 as *const c_void,
+                h as i32,
+                x16r as *const c_void,
+                h as i32,
+                &0.0,
+                logits as *mut c_void,
+                v as i32,
+                true,
+            )
+        }
+    {
+        return;
+    }
+    let block = (LCE_ROW_CHUNK_BYTES / 2 / (v * 4)).max(1);
+    let mut i = 0;
+    while i < r {
+        let rb = block.min(r - i);
+        unsafe {
+            crate::cuda::storage_gemm::gemm16(
+                true,
+                false,
+                v,
+                rb,
+                h,
+                1.0,
+                head.w16,
+                h,
+                x16r + i * h * 2,
+                h,
+                0.0,
+                logits + i * v * 2,
+                v,
+                true,
+            )
+        };
+        i += rb;
+    }
+}
+
+/// The fused head's forward with its whole backward (see the section
+/// header): per-row losses into `loss_out [rows]`, the x gradient into `dx
+/// [rows, h]` (f32, ZEROED by the caller, as `gemm_backward` accumulates
+/// into it; 0 = no x gradient), and `dw += dw_alpha · dlogits^T x` into the
+/// `[v, h]` f32 accumulator `dw`. `scale` is `grad_output / num_valid`, as
+/// the backward folds it. Biasless heads only. Returns the CUresult-style
+/// code of the first failure (0 = success) and the route taken.
+///
+/// PRECONDITION (unenforceable here): as [`gemm_forward`].
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_forward_grad(
+    x_dev: u64,
+    w_dev: u64,
+    targets_dev: u64,
+    loss_out_dev: u64,
+    dx_dev: u64,
+    dw_dev: u64,
+    rows: u64,
+    v: u64,
+    h: u64,
+    scale: f32,
+    dw_alpha: f32,
+) -> (u32, GradRoute) {
+    if let Some(head) = RowHead::new(x_dev, w_dev, rows, v, h) {
+        let rc = row_chunked(
+            &head,
+            targets_dev,
+            loss_out_dev,
+            dx_dev,
+            dw_dev,
+            rows,
+            v,
+            h,
+            scale,
+            dw_alpha,
+        );
+        return (rc, GradRoute::RowChunked);
+    }
+    let lse = crate::cuda::inner::alloc_managed((rows * 4) as usize) as u64;
+    let mut rc = gemm_forward(
+        x_dev,
+        w_dev,
+        0,
+        targets_dev,
+        loss_out_dev,
+        lse,
+        rows,
+        v,
+        h,
+        false,
+    );
+    if rc == 0 {
+        rc = gemm_backward(
+            x_dev,
+            w_dev,
+            0,
+            targets_dev,
+            lse,
+            dx_dev,
+            dw_dev,
+            0,
+            rows,
+            v,
+            h,
+            scale,
+            false,
+            dw_alpha,
+        );
+    }
+    crate::cuda::inner::free_managed(lse as *mut c_void);
+    (rc, GradRoute::VocabChunked)
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn row_chunked(
+    head: &RowHead,
+    targets_dev: u64,
+    loss_out_dev: u64,
+    dx_dev: u64,
+    dw_dev: u64,
+    rows: u64,
+    v: u64,
+    h: u64,
+    scale: f32,
+    dw_alpha: f32,
+) -> u32 {
+    use crate::cuda::inner;
+    use crate::cuda::storage_gemm::gemm16;
+    let r_chunk = row_chunk(rows, v);
+    let logits = inner::alloc_managed((r_chunk * v * 2) as usize) as u64;
+    let mut r0 = 0u64;
+    let mut rc = 0u32;
+    while r0 < rows {
+        let r = r_chunk.min(rows - r0);
+        let x16r = head.x16 + r0 * h * 2;
+        logits_gemm(head, logits, r0, r, v, h);
+        let mut a_logits = logits;
+        let mut a_tgt = targets_dev + r0 * 8;
+        let mut a_loss = loss_out_dev + r0 * 4;
+        let mut a_rows = r;
+        let mut a_cols = v;
+        let mut a_scale = scale;
+        let args: [*mut c_void; 6] = [
+            &mut a_logits as *mut _ as *mut c_void,
+            &mut a_tgt as *mut _ as *mut c_void,
+            &mut a_loss as *mut _ as *mut c_void,
+            &mut a_rows as *mut _ as *mut c_void,
+            &mut a_cols as *mut _ as *mut c_void,
+            &mut a_scale as *mut _ as *mut c_void,
+        ];
+        rc = inner::kernel_launch(
+            super::fused_kernels::lce_rows_grad_bf16_ptx().as_ptr(),
+            c"nsl_lce_rows_grad_bf16".as_ptr().cast(),
+            [r as i64, 1, 1],
+            [i64::from(nsl_kir::kernels::lce_rows::LCE_ROWS_BLOCK), 1, 1],
+            &args,
+            0,
+        ) as u32;
+        if rc != 0 {
+            crate::nsl_log!(
+                WARN,
+                "fused-lce-gemm",
+                "[fused-lce-gemm] row softmax launch failed at row {r0}: {rc}"
+            );
+            break;
+        }
+        // SAFETY (the two GEMMs): column-major views of row-major buffers
+        // sized by the shapes above, as `gemm_backward`'s bf16 head maps them.
+        //
+        // dx[r0.., :] = dlogits @ W16   [r, h]
+        if dx_dev != 0 {
+            unsafe {
+                gemm16(
+                    false,
+                    false,
+                    h,
+                    r,
+                    v,
+                    1.0,
+                    head.w16,
+                    h,
+                    logits,
+                    v,
+                    0.0,
+                    dx_dev + r0 * h * 4,
+                    h,
+                    false,
+                )
+            };
+        }
+        // dW += dw_alpha · dlogits^T @ x16[r0.., :]   [v, h]
+        unsafe {
+            gemm16(
+                false, true, h, v, r, dw_alpha, x16r, h, logits, v, 1.0, dw_dev, h, false,
+            )
+        };
+        r0 += r;
+    }
+    inner::free_managed(logits as *mut c_void);
+    rc
 }

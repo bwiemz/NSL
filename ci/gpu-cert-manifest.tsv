@@ -109,6 +109,12 @@ crates/nsl-cli/tests/inference_loop_leak_gate.rs	inference_loop_method_call_live
 crates/nsl-cli/tests/inference_loop_leak_gate.rs	inference_loop_method_temp_live_blocks_iteration_independent	gpu	requires CUDA GPU
 crates/nsl-cli/tests/inference_loop_leak_gate.rs	inference_loop_borrow_rebind_does_not_free_weights	gpu	requires CUDA GPU
 crates/nsl-cli/tests/kernel_profile_timing_gate.rs	profile_kernels_reports_real_durations	gpu	requires CUDA GPU
+crates/nsl-cli/tests/lce_grad_in_forward_gate.rs	in_f32_storage_the_gradient_in_the_forward_is_the_backwards_bit_for_bit	gpu	requires CUDA GPU
+crates/nsl-cli/tests/lce_grad_in_forward_gate.rs	at_bf16_the_row_chunked_route_agrees_with_the_backward_route	gpu	requires CUDA GPU
+crates/nsl-cli/tests/lce_grad_in_forward_gate.rs	at_bf16_the_row_chunked_route_scales_the_gradient_as_the_backward_route_does	gpu	requires CUDA GPU
+crates/nsl-cli/tests/lce_grad_in_forward_gate.rs	deterministic_runs_of_the_row_chunked_route_are_reproducible	gpu	requires CUDA GPU
+crates/nsl-cli/tests/lce_grad_in_forward_gate.rs	a_backward_handed_another_upstream_gradient_stops_the_run	gpu	requires CUDA GPU
+crates/nsl-cli/tests/lce_grad_in_forward_gate.rs	a_scaled_loss_keeps_the_head_in_its_backward	gpu	requires CUDA GPU
 crates/nsl-cli/tests/linear_3d_gpu_gate.rs	a_3d_linear_on_the_gpu_matches_pytorch	gpu	requires CUDA GPU
 crates/nsl-cli/tests/linear_3d_gpu_gate.rs	a_transposed_input_on_the_gpu_is_read_in_logical_order	gpu	requires CUDA GPU
 crates/nsl-cli/tests/linear_3d_gpu_gate.rs	a_wrong_length_bias_on_the_gpu_is_refused	gpu	requires CUDA GPU
@@ -443,16 +449,19 @@ crates/nsl-codegen/tests/tier_b_tile_skip_gpu_parity.rs	tier_b_aligned_docs_s409
 crates/nsl-codegen/tests/track_b_head_dim_128_repro.rs	track_b_d_model_128_rejected_by_validator	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/track_b_head_dim_128_repro.rs	track_b_head_dim_128_d_model_32_launches	gpu	requires CUDA GPU
 crates/nsl-codegen/tests/wggo_sidecar_population.rs	run_harness_stub_with_wggo_hook_populates_wggo_head_gradients	broken	requires cfg(test) BSS stub injection; covered by mod.rs unit test
+crates/nsl-kir/src/kernels/flash_attn/bwd.rs	write_production_backward_ptx	diagnostic	diagnostic: writes PTX files into NSL_FLASH_BWD_PTX_DIR
 crates/nsl-kir/src/kernels/optim.rs	split_round_trips_every_bit_pattern	diagnostic	diagnostic: exhaustive 2^32 sweep of the split round trip (a minute in debug; run --ignored --release)
 crates/nsl-runtime/src/attention_tc.rs	tc_backward_matches_f64_reference_at_realistic_gradient_magnitudes	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	tc_bf16_io_is_the_f32_kernel_rounded_once	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	the_lpt_grid_order_gives_the_same_bits	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	the_bshd_kernels_are_the_contiguous_kernels_bit_for_bit	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
+crates/nsl-runtime/src/attention_tc.rs	the_register_bound_gives_the_same_bits	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	tc_ffi_reads_and_writes_the_bshd_layout	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	tc_backward_small_rows_keep_their_precision	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	grouped_kv_is_the_expanded_computation_up_to_the_group_sum	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	tc_ffi_forward_and_backward_match_the_reference	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/attention_tc.rs	tc_attention_kernel_times	diagnostic	diagnostic: times the tensor-core attention kernels at the production shapes
+crates/nsl-runtime/src/attention_tc.rs	tc_backward_layout_times	diagnostic	diagnostic: times the backward kernels in both head layouts at the 1B and 500M shapes
 crates/nsl-runtime/src/attention_tc.rs	tc_forward_matches_f64_reference	gpu	requires a CUDA GPU; run with --features cuda -- --ignored
 crates/nsl-runtime/src/c_api/mod.rs	zz_tensor_to_desc_null_child	helper	child process — driven by nsl_tensor_to_desc_null_ptr_does_not_deref
 crates/nsl-runtime/src/cuda/storage_kernels.rs	swiglu_kernel_timing	diagnostic	diagnostic: times the fused SwiGLU kernels on the GPU
@@ -537,6 +546,8 @@ crates/nsl-runtime/tests/hwcert_kir_numerics_gpu.rs	dropout_kir_kernel_is_bit_ex
 crates/nsl-runtime/tests/hwcert_kir_numerics_gpu.rs	dropout_regenerated_mask_is_bit_exact_against_the_stored_mask_on_silicon	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/inspect_ffi.rs	gpu_stats_parity_with_cpu	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/kernel_launch_tensors_gpu.rs	kernel_launch_tensors_vec_add_writes_correct_output	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/lce_grad_in_forward_gpu.rs	zz_lce_gif_probe_child	helper	spawned by both_routes_match_the_f64_reference_gpu
+crates/nsl-runtime/tests/lce_grad_in_forward_gpu.rs	both_routes_match_the_f64_reference_gpu	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_acc_bf16_mode_gpu.rs	route_zero_in_the_bf16_math_mode_equals_the_eager_matmul_and_the_add_bit_for_bit	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_acc_gpu.rs	the_accumulating_gemm_equals_the_gemm_and_the_add_bit_for_bit	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_acc_gpu.rs	a_product_shaped_unlike_the_accumulator_and_route_zero_take_the_three_calls	gpu	requires CUDA GPU

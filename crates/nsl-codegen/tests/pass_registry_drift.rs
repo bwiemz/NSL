@@ -686,6 +686,14 @@ const NOT_A_PASS: &[(&str, &str)] = &[
     ),
     ("kernel", "kernel skeleton/IR/lowering machinery"),
     ("layerwise", "CSLA layerwise accumulation scheduling"),
+    (
+        "lce_grad_in_forward",
+        "perf round 2: the fused LM heads whose gradient the forward computes — a plan over \
+         the adjoint tape (and a rewrite of the planned extracts) that the train driver runs \
+         from `stmt_train/lce_gif.rs` and `wengert_lower.rs` consults while emitting Cranelift \
+         IR, not a registered pass. It reports its own effect (`[lce-grad-in-forward] N of M \
+         fused LM head(s) ...`, pinned by an exec-marker)",
+    ),
     ("lib", "crate root"),
     ("linker", "object linking"),
     (

@@ -51,6 +51,11 @@
 //!     backward folds and the CSLA schedule report, fed by an
 //!     [`adjoint_tape_opt::AdjointTapeOptInputs`] and returning the
 //!     parameter-gradient adjoint set; a pure tape rewrite.
+//!   - [`lce_gif`] — section 6b.6 of the source-AD arm: the fused LM heads
+//!     whose gradient the forward computes (`crate::lce_grad_in_forward`),
+//!     the rewrite of their backward extracts, and the checks the driver
+//!     runs around the lowerings that carry the plan out, fed by an
+//!     [`lce_gif::LceGifInputs`]; a pure tape rewrite.
 //!   - [`ccr_adjoint_frees`] — section 6d of the source-AD arm: CCR's
 //!     adjoint-region last-use freeing (the protected gradient set, the
 //!     pre-insertion wgrad fusion plan, the in-place `FreeTensor`
@@ -152,6 +157,7 @@ pub(crate) mod driver;
 pub(crate) mod emit_state;
 pub(crate) mod epoch_close;
 pub(crate) mod fase_hook_lowering;
+pub(crate) mod lce_gif;
 pub(crate) mod forward_lowering;
 pub(crate) mod health_hooks;
 pub(crate) mod identity;

@@ -870,6 +870,42 @@ pub static REGISTRY: &[EnvVar] = &[
         "Transport for disaggregated-inference KV-cache transfer, overriding hardware auto-detection."
     ),
     var!(
+        "NSL_LCE_GIF_PROBE",
+        Bool,
+        "presence marks the child; parent sets 1",
+        "unset",
+        Test,
+        Test,
+        "Test harness only: marks the re-exec'd child of the LM head gradient-in-forward GPU gate (runtime routes vs f64)."
+    ),
+    var!(
+        "NSL_LCE_GIF_TEST_ASSUMED_GRAD",
+        Float,
+        "f32",
+        "unset (the loss seed, 1)",
+        Test,
+        Compile,
+        "Test harness only: the upstream gradient a gradient-in-forward LM head assumes, to show the backward's check stops the run."
+    ),
+    var!(
+        "NSL_LCE_GRAD_IN_FORWARD",
+        Bool,
+        "0 only",
+        "on (a fused LM head whose upstream gradient is the loss seed computes its gradient in the forward)",
+        Behavior,
+        Compile,
+        "Set to 0 at build time to keep every fused LM head's gradient in its backward (the logits recompute)."
+    ),
+    var!(
+        "NSL_LCE_ROW_CHUNK",
+        Int,
+        "rows (0 = the budget's)",
+        "0 (1,024 rows at a 49,152 vocab: 96 MiB of bf16 logits)",
+        Perf,
+        Runtime,
+        "Rows per chunk of the LM head's gradient-in-forward route; overrides the 96 MiB logits budget."
+    ),
+    var!(
         "NSL_LEGACY_NULL_STREAM",
         Bool,
         "1 only (both sites)",

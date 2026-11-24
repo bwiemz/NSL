@@ -91,41 +91,41 @@ impl LceChunkOp {
     }
 }
 
-fn var(b: &mut KirBuilder, ty: KirType) -> VarId {
+pub(super) fn var(b: &mut KirBuilder, ty: KirType) -> VarId {
     b.new_typed_var(ty)
 }
 
-fn konst(b: &mut KirBuilder, ty: KirType, value: ConstValue) -> VarId {
+pub(super) fn konst(b: &mut KirBuilder, ty: KirType, value: ConstValue) -> VarId {
     let dst = var(b, ty.clone());
     b.emit(KirOp::Const(dst, KirConst { ty, value }));
     dst
 }
 
-fn op1(b: &mut KirBuilder, ty: KirType, op: fn(VarId, VarId) -> KirOp, x: VarId) -> VarId {
+pub(super) fn op1(b: &mut KirBuilder, ty: KirType, op: fn(VarId, VarId) -> KirOp, x: VarId) -> VarId {
     let dst = var(b, ty);
     b.emit(op(dst, x));
     dst
 }
 
-fn op2(b: &mut KirBuilder, ty: KirType, op: fn(VarId, VarId, VarId) -> KirOp, x: VarId, y: VarId) -> VarId {
+pub(super) fn op2(b: &mut KirBuilder, ty: KirType, op: fn(VarId, VarId, VarId) -> KirOp, x: VarId, y: VarId) -> VarId {
     let dst = var(b, ty);
     b.emit(op(dst, x, y));
     dst
 }
 
-fn cast(b: &mut KirBuilder, src: VarId, ty: KirType) -> VarId {
+pub(super) fn cast(b: &mut KirBuilder, src: VarId, ty: KirType) -> VarId {
     let dst = var(b, ty.clone());
     b.emit(KirOp::Cast(dst, src, ty));
     dst
 }
 
-fn cmp(b: &mut KirBuilder, x: VarId, y: VarId, op: CmpOp) -> VarId {
+pub(super) fn cmp(b: &mut KirBuilder, x: VarId, y: VarId, op: CmpOp) -> VarId {
     let dst = var(b, KirType::Bool);
     b.emit(KirOp::Cmp(dst, x, y, op));
     dst
 }
 
-fn load_at(b: &mut KirBuilder, ty: KirType, space: AddressSpace, base: VarId, i: VarId) -> VarId {
+pub(super) fn load_at(b: &mut KirBuilder, ty: KirType, space: AddressSpace, base: VarId, i: VarId) -> VarId {
     let addr = var(b, KirType::Ptr(Box::new(ty.clone()), space));
     b.emit(KirOp::PtrOffset(addr, base, i));
     let v = var(b, ty);
@@ -133,7 +133,7 @@ fn load_at(b: &mut KirBuilder, ty: KirType, space: AddressSpace, base: VarId, i:
     v
 }
 
-fn store_at(b: &mut KirBuilder, space: AddressSpace, base: VarId, i: VarId, v: VarId) {
+pub(super) fn store_at(b: &mut KirBuilder, space: AddressSpace, base: VarId, i: VarId, v: VarId) {
     let addr = var(b, KirType::Ptr(Box::new(KirType::F32), space));
     b.emit(KirOp::PtrOffset(addr, base, i));
     b.emit(KirOp::Store(addr, v, space));
@@ -166,7 +166,7 @@ fn value(b: &mut KirBuilder, logits: VarId, k: VarId, bias: VarId, kb: VarId, no
 /// A column loop from the current block: `k = tid, tid + 256, … < cols`,
 /// carrying an `f32` through `body(b, k, acc) -> acc'`. Returns the carried
 /// value at the exit, whose block is current on return.
-fn column_loop(
+pub(super) fn column_loop(
     b: &mut KirBuilder,
     tid: VarId,
     cols: VarId,
@@ -198,7 +198,7 @@ fn column_loop(
 /// Thread 0's in-order fold of `sdata[1 .. 256]` into `partial` with
 /// `combine`, from the current block. Returns the total; the builder is in
 /// the block after the fold.
-fn thread0_fold(b: &mut KirBuilder, sdata: VarId, partial: VarId, combine: fn(VarId, VarId, VarId) -> KirOp) -> VarId {
+pub(super) fn thread0_fold(b: &mut KirBuilder, sdata: VarId, partial: VarId, combine: fn(VarId, VarId, VarId) -> KirOp) -> VarId {
     use AddressSpace::Shared;
     use KirType::{F32, U32};
     let head = b.new_block();
@@ -226,7 +226,7 @@ fn thread0_fold(b: &mut KirBuilder, sdata: VarId, partial: VarId, combine: fn(Va
 }
 
 /// `2^((x - m) · log2 e)`: a `sub.rn`, a `mul.rn` and a bare `ex2.approx`.
-fn exp_shifted(b: &mut KirBuilder, x: VarId, m: VarId) -> VarId {
+pub(super) fn exp_shifted(b: &mut KirBuilder, x: VarId, m: VarId) -> VarId {
     use KirType::F32;
     let d = op2(b, F32, KirOp::SubRn, x, m);
     let log2_e = konst(b, F32, ConstValue::F32(f32::from_bits(LOG2_E_BITS)));
