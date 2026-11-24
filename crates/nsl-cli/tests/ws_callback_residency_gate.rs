@@ -61,6 +61,8 @@ fn build_only(source: &str, tag: &str) -> (bool, String) {
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
         .output()
         .expect("spawn nsl build");
+    // Nothing below reads the directory, and its executable is ~130 MB.
+    let _ = std::fs::remove_dir_all(&tmp);
     (
         output.status.success(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
