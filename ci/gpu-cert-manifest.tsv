@@ -601,6 +601,12 @@ crates/nsl-runtime/tests/matmul_transposed_operand.rs	the_default_under_pedantic
 crates/nsl-runtime/tests/matmul_transposed_operand.rs	the_env_var_wins_over_the_coupling	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/matmul_transposed_operand.rs	the_op_t_tradeoff_is_remeasurable	diagnostic	diagnostic: reruns the OP_T-vs-copy measurement grid behind the transpose-views default and prints the table; asserts only that the probes ran
 crates/nsl-runtime/tests/mul_scalar_gpu.rs	mul_scalar_inplace_gpu_matches_cpu_reference	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/mx_quant_gpu.rs	the_row_quantizer_writes_the_reference_bytes	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/mx_quant_gpu.rs	the_transposing_quantizer_writes_the_reference_bytes	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/mx_quant_gpu.rs	the_gemm_is_the_product_of_the_dequantized_operands	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/mx_quant_gpu.rs	the_weight_gradient_arrangement_multiplies_two_transposed_quantizations	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/mx_quant_gpu.rs	the_1b_gate_up_weight_gradient_shape_runs_on_mxfp8	gpu	requires CUDA GPU
+crates/nsl-runtime/tests/mx_quant_gpu.rs	each_block_scale_lands_on_its_own_block	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/precision_cast_gpu_dispatch.rs	gpu_to_bf16_round_trip_within_epsilon	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/precision_cast_gpu_dispatch.rs	gpu_to_fp16_round_trip_within_epsilon	gpu	requires CUDA GPU
 crates/nsl-runtime/tests/precision_cast_gpu_dispatch.rs	gpu_to_bf16_size_sweep	gpu	requires CUDA GPU
