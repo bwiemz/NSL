@@ -183,7 +183,10 @@ fn warn_on_legacy_env_once() {
 /// gate comparing csla-vs-baseline loss streams is vacuous if the fused
 /// kernel silently never engaged (composite fallback) — these counters
 /// prove which path ran and how many times.
-static FUSED_LCE_LAUNCH_COUNTS: [std::sync::atomic::AtomicU64; 5] = [
+static FUSED_LCE_LAUNCH_COUNTS: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -193,12 +196,16 @@ static FUSED_LCE_LAUNCH_COUNTS: [std::sync::atomic::AtomicU64; 5] = [
 
 /// Test/diagnostic probe: successful fused linear-CE launches for `kind`
 /// (0 = forward, 1 = forward_large, 2 = backward, 3 = forward_gemm,
-/// 4 = backward_gemm). Other kinds return -1.
+/// 4 = backward_gemm, 5 = forward_gemm_grad (the forward that also computes
+/// the head's gradient), 6 = those of 5 that took the row-chunked route,
+/// 7 = those of 5 that took the vocabulary-chunked route). Other kinds
+/// return -1.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_fused_lce_launch_count(kind: i64) -> i64 {
     match kind {
-        0..=4 => FUSED_LCE_LAUNCH_COUNTS[kind as usize]
-            .load(std::sync::atomic::Ordering::Relaxed) as i64,
+        0..=7 => {
+            FUSED_LCE_LAUNCH_COUNTS[kind as usize].load(std::sync::atomic::Ordering::Relaxed) as i64
+        }
         _ => -1,
     }
 }
@@ -1429,6 +1436,139 @@ pub extern "C" fn nsl_fused_linear_ce_backward_gemm_acc(
     rc
 }
 
+/// The fused LM head's forward that also computes its whole backward: the
+/// training route for a head whose upstream gradient is known when the
+/// forward runs (the compiler proves it is the loss seed; see
+/// `nsl-codegen`'s `lce_grad_in_forward`).
+///
+/// Writes the per-row losses into `loss_out [B*S]` as
+/// [`nsl_fused_linear_ce_forward_gemm`] does, the x gradient into the tensor
+/// data `dx_out [B*S, H]` (f32, zeroed by the caller; 0 = no x gradient is
+/// read), and ADDS `dw_alpha · dlogitsᵀ x` (f32 bits) into `dw_acc`, a
+/// weight's gradient-accumulation buffer, as
+/// [`nsl_fused_linear_ce_backward_gemm_acc`] does. `grad_bits` (f32 bits) is
+/// the upstream gradient the forward assumes; the scale is `grad /
+/// max(num_valid, 1)`, as the backward folds it. The backward of such a head
+/// calls [`nsl_fused_lce_check_upstream_grad`] with the same bits.
+///
+/// Biasless heads, raw DEVICE pointers and f32 storage, as the `_gemm`
+/// entries. Anything but a contiguous device f32 `[V, H]` accumulator stops
+/// the program before it is written, and so does a failed launch (the buffer
+/// would hold a partial sum).
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nsl_fused_linear_ce_forward_gemm_grad(
+    x_ptr: i64,
+    w_ptr: i64,
+    targets_ptr: i64,
+    loss_out_ptr: i64,
+    dx_out_ptr: i64,
+    dw_acc: i64,
+    b: i64,
+    s: i64,
+    v: i64,
+    h: i64,
+    num_valid: i64,
+    grad_bits: i64,
+    dw_alpha_bits: i64,
+) -> i64 {
+    let acc = crate::tensor::NslTensor::from_ptr_ref(dw_acc);
+    if acc.dtype != 1 || acc.device == 0 || !acc.is_contiguous() || acc.len != v * h {
+        crate::fatal::die(
+            crate::fatal::Fatal::ShapeMismatch,
+            &format!(
+                "nsl_fused_linear_ce_forward_gemm_grad: the accumulator must be a contiguous device \
+                 f32 tensor of {v} x {h} elements (got dtype {}, device {}, {} elements)",
+                acc.dtype, acc.device, acc.len
+            ),
+        );
+    }
+    let grad = f32::from_bits(grad_bits as u32);
+    let dw_alpha = f32::from_bits(dw_alpha_bits as u32);
+    #[cfg(feature = "cuda")]
+    {
+        let rows = (b * s) as u64;
+        // The backward's convention (`backward_gemm`).
+        let scale = grad / (num_valid.max(1) as f32);
+        let (rc, route) = crate::cuda::fused_ce_kernels::gemm_forward_grad(
+            x_ptr as u64,
+            w_ptr as u64,
+            targets_ptr as u64,
+            loss_out_ptr as u64,
+            dx_out_ptr as u64,
+            acc.data as u64,
+            rows,
+            v as u64,
+            h as u64,
+            scale,
+            dw_alpha,
+        );
+        if rc != 0 {
+            crate::fatal::die(
+                crate::fatal::Fatal::Cublas,
+                &format!(
+                    "nsl_fused_linear_ce_forward_gemm_grad: the LM head's forward failed (rc {rc}) after it \
+                     may have added part of the weight gradient into the accumulation buffer"
+                ),
+            );
+        }
+        crate::cuda::inner::sync_after_kernel();
+        use std::sync::atomic::Ordering::Relaxed;
+        FUSED_LCE_LAUNCH_COUNTS[5].fetch_add(1, Relaxed);
+        let slot = match route {
+            crate::cuda::fused_ce_kernels::GradRoute::RowChunked => 6,
+            crate::cuda::fused_ce_kernels::GradRoute::VocabChunked => 7,
+        };
+        FUSED_LCE_LAUNCH_COUNTS[slot].fetch_add(1, Relaxed);
+        0
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (
+            x_ptr,
+            w_ptr,
+            targets_ptr,
+            loss_out_ptr,
+            dx_out_ptr,
+            b,
+            s,
+            num_valid,
+            grad,
+            dw_alpha,
+        );
+        crate::fatal::cuda_not_compiled()
+    }
+}
+
+/// Why the upstream gradient a head's backward received is not the one its
+/// forward assumed, or `None` when they are the same value.
+pub fn upstream_grad_mismatch(actual: f32, assumed: f32) -> Option<String> {
+    (actual.to_bits() != assumed.to_bits()).then(|| {
+        format!(
+            "the fused LM head computed its gradient in the forward assuming an upstream gradient \
+             of {assumed:e}, but its backward received {actual:e}: the weight gradient already added \
+             into the accumulation buffer is wrong. This is a compiler defect (the plan proves the \
+             upstream gradient is the loss seed); rebuild with NSL_LCE_GRAD_IN_FORWARD=0 to keep \
+             the head's gradient in its backward, and report it"
+        )
+    })
+}
+
+/// The backward of a head whose gradient its forward computed
+/// ([`nsl_fused_linear_ce_forward_gemm_grad`]): stops the program unless
+/// the upstream gradient `grad_output` (a one-element tensor) is exactly
+/// the value the forward assumed (`assumed_bits`, f32 bits).
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_fused_lce_check_upstream_grad(grad_output: i64, assumed_bits: i64) {
+    let actual = crate::tensor::nsl_tensor_item(grad_output) as f32;
+    if let Some(why) = upstream_grad_mismatch(actual, f32::from_bits(assumed_bits as u32)) {
+        crate::fatal::die(
+            crate::fatal::Fatal::ShapeMismatch,
+            &format!("nsl_fused_lce_check_upstream_grad: {why}"),
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn backward_gemm(
     grad_output_bits: i64,
@@ -1632,6 +1772,26 @@ mod v7_default_activation_tests {
         assert_eq!(
             rc, -1,
             "backward FFI must short-circuit with -1 when diagnostic override is set"
+        );
+    }
+}
+
+#[cfg(test)]
+mod upstream_grad_tests {
+    use super::upstream_grad_mismatch;
+
+    /// The check passes the assumed value only: not a neighbouring float,
+    /// not another scale, not a NaN.
+    #[test]
+    fn only_the_assumed_value_passes() {
+        assert_eq!(upstream_grad_mismatch(1.0, 1.0), None);
+        assert!(upstream_grad_mismatch(0.5, 1.0).is_some());
+        assert!(upstream_grad_mismatch(f32::from_bits(1.0f32.to_bits() + 1), 1.0).is_some());
+        assert!(upstream_grad_mismatch(f32::NAN, 1.0).is_some());
+        assert!(
+            upstream_grad_mismatch(1.0, 0.5)
+                .unwrap()
+                .contains("NSL_LCE_GRAD_IN_FORWARD=0")
         );
     }
 }

@@ -99,6 +99,12 @@ fn run(tag: &str, bf16: bool, deterministic: bool, envs: &[(&str, &str)]) -> Run
     cmd.arg(&prog)
         .current_dir(&tmp)
         .env("NSL_STDLIB_PATH", root.join("stdlib"))
+        // The LM head keeps its gradient in its backward on every arm: this
+        // gate isolates the tied embedding's accumulation, and the head's
+        // gradient-in-forward route (bf16 logits) moves the bf16 arm's later
+        // losses by more than this gate's tolerance on its own.
+        // `lce_grad_in_forward_gate.rs` holds the two together.
+        .env("NSL_LCE_GRAD_IN_FORWARD", "0")
         .envs(envs.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

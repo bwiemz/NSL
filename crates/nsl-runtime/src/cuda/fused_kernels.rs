@@ -1040,6 +1040,22 @@ pub(crate) fn lce_finalize_f32_ptx() -> &'static str {
     MODULE.get_or_init(|| String::from_utf8(nsl_kir::kernels::lce_finalize::ptx()).expect("PTX must be ASCII"))
 }
 
+/// `nsl_lce_rows_grad_bf16(logits, targets, loss, rows, cols, scale)`: the
+/// row-chunked head's softmax kernel over bf16 logits of whole vocabulary
+/// rows: per-row loss, and the gradient of the logits times `scale` written
+/// in place (one 256-thread block per row). Built by
+/// `nsl_kir::kernels::lce_rows`; NUL-terminated, built once.
+pub(crate) fn lce_rows_grad_bf16_ptx() -> &'static str {
+    use std::sync::OnceLock;
+    static MODULE: OnceLock<String> = OnceLock::new();
+    MODULE.get_or_init(|| {
+        String::from_utf8(nsl_kir::kernels::lce_rows::ptx(
+            nsl_kir::kernels::storage::Storage::Bf16,
+        ))
+        .expect("PTX must be ASCII")
+    })
+}
+
 /// Every hand-written PTX module in this file, paired with its constant name.
 ///
 /// Consumed by the `ptxas` gate in `super::tests`, which assembles each one.

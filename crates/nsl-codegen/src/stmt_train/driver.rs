@@ -1698,6 +1698,26 @@ impl Compiler<'_> {
                     ccr_plan: &ccr_plan,
                 });
 
+                // 6b.6 The fused LM heads whose gradient the forward computes
+                // (`crate::lce_grad_in_forward`). Moved to
+                // `stmt_train/lce_gif.rs`: the plan, and the rewrite of the
+                // planned extracts, before CCR's splice so that every pass
+                // below sees a backward that no longer reads the head's input.
+                let mut lce_gif =
+                    self.plan_lce_grad_in_forward(crate::stmt_train::lce_gif::LceGifInputs {
+                        adjoint: &mut adjoint,
+                        effective_primal: &effective_primal,
+                        extractor: &extractor,
+                        generator: &generator,
+                        ccr_plan: &ccr_plan,
+                        param_paths: &param_paths,
+                        primal_vars: &primal_vars,
+                        accum_list,
+                        accum_scale: fase_plan.recipe.accum_scale,
+                        fase_hook_active,
+                        csla_active,
+                    });
+
                 // 6c. CCR P1.a: splice recompute clones + FreeTensor markers
                 // into the (final, post-eliminate) adjoint and remap its
                 // references from the early-freed originals to the clones.
@@ -2040,6 +2060,12 @@ impl Compiler<'_> {
                     // the tables are populated.
                     self.emit_param_plan_check(builder, plan, param_list)?;
                 }
+                // The planned heads' forward frees their input only if still no
+                // backward op reads it (CCR's splice and frees ran since).
+                if let Some(g) = lce_gif.as_mut() {
+                    crate::stmt_train::lce_gif::recheck_lce_gif_frees(g, &adjoint);
+                }
+                self.lce_gif = lce_gif.take();
                 // Forward lowering.
                 // Moved to `stmt_train/forward_lowering.rs` byte-for-byte (roadmap A1):
                 // the memory-planner tape-unchanged assertion, the Item 11
@@ -2211,6 +2237,11 @@ impl Compiler<'_> {
                         );
                     }
                 }
+                // A planned head's forward already wrote its weight gradient:
+                // the hook must name the same buffer for its parameter.
+                if let Some(g) = &self.lce_gif {
+                    crate::stmt_train::lce_gif::check_lce_gif_hook_map(g, &adj_vid_to_hook_entry)?;
+                }
 
                 // 7. Lower ADJOINT Wengert list using full_vars, which now
                 //    contains all intermediate VarId → Value mappings from
@@ -2291,6 +2322,13 @@ impl Compiler<'_> {
                         }
                     }
                 };
+                // The planned heads: each forward ran once and its saved x
+                // gradient reached its backward.
+                if let Some(g) = self.lce_gif.take() {
+                    let unclaimed = self.lce_gif_dx.len();
+                    self.lce_gif_dx.clear();
+                    crate::stmt_train::lce_gif::finish_lce_gif(&g, unclaimed)?;
+                }
                 // NSL_PHASE_TIMING: end of backward (all adjoint ops emitted).
                 if let (Some(t0), Some(t1)) = (phase_t0, phase_t1) {
                     self.compile_call_by_name(builder, "nsl_cuda_device_synchronize", &[])?;

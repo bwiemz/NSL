@@ -10689,6 +10689,7 @@ mod tests {
         all.push(("nsl_flash_lse_gqa_f32", super::fused_kernels::flash_lse_gqa_f32_ptx(), true));
         all.push(("nsl_lce_chunk_stats_f32", super::fused_kernels::lce_chunk_stats_f32_ptx(), true));
         all.push(("nsl_lce_chunk_dlogits_f32", super::fused_kernels::lce_chunk_dlogits_f32_ptx(), true));
+        all.push(("nsl_lce_rows_grad_bf16", super::fused_kernels::lce_rows_grad_bf16_ptx(), true));
         all.push(("nsl_bmm_f32", super::fused_kernels::bmm_f32_ptx(), true));
         all.push(("nsl_maxpool2d_f32", super::fused_kernels::maxpool2d_f32_ptx(), true));
         all.push(("nsl_conv2d_f32", super::fused_kernels::conv2d_f32_ptx(), true));
