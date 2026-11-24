@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 const LOSS_WINDOW: usize = 100;
 const EMA_ALPHA: f64 = 0.05;
@@ -29,9 +29,12 @@ pub struct HealthCollector {
     flush_interval: u64,
     loss_history: VecDeque<f64>,
     loss_ema: Option<f64>,
-    grad_norm_per_layer: HashMap<u32, f64>,
-    weight_init: HashMap<String, f64>,
-    weight_current: HashMap<String, f64>,
+    // Ordered maps: the totals below are f64 sums over these, and a sum's bits depend on
+    // its order. A HashMap iterates in a per-instance random order, so two runs that
+    // recorded the same norms could report totals one ulp apart.
+    grad_norm_per_layer: BTreeMap<u32, f64>,
+    weight_init: BTreeMap<String, f64>,
+    weight_current: BTreeMap<String, f64>,
     nan_inf_count: u64,
 }
 
@@ -49,9 +52,9 @@ impl HealthCollector {
             flush_interval: FLUSH_INTERVAL_DEFAULT,
             loss_history: VecDeque::with_capacity(LOSS_WINDOW),
             loss_ema: None,
-            grad_norm_per_layer: HashMap::new(),
-            weight_init: HashMap::new(),
-            weight_current: HashMap::new(),
+            grad_norm_per_layer: BTreeMap::new(),
+            weight_init: BTreeMap::new(),
+            weight_current: BTreeMap::new(),
             nan_inf_count: 0,
         }
     }
@@ -150,7 +153,11 @@ impl HealthCollector {
             loss_ema: self.loss_ema,
             loss_ema_slope: slope,
             grad_norm_total,
-            per_layer_grad_norm: self.grad_norm_per_layer.clone(),
+            per_layer_grad_norm: self
+                .grad_norm_per_layer
+                .iter()
+                .map(|(&k, &v)| (k, v))
+                .collect(),
             weight_norm_total,
             per_tensor_weight_pct_delta,
             nan_inf_count_window: self.nan_inf_count,

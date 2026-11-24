@@ -171,8 +171,20 @@ fn the_weight_matrices_are_selected_and_the_norm_gains_are_not() {
         "{}",
         r.out
     );
-    // The q and k dgrads read the f32 RoPE adjoints: the only GEMMs whose
-    // sole bf16 operand is a stored parameter (2 per block).
+    // The storage plan's rule 4b writes the RoPE adjoints bf16 for the q and
+    // k projections' GEMMs, so no GEMM's sole bf16 operand is a stored
+    // parameter.
+    assert!(
+        r.out
+            .contains("(0 of the GEMMs reading them keep the eager bf16 mode's"),
+        "{}",
+        r.out
+    );
+    // Without it (`NSL_ROPE_BWD_BF16=0`) the q and k dgrads read the f32
+    // RoPE adjoints: the only GEMMs whose sole bf16 operand is a stored
+    // parameter (2 per block).
+    let r = build(SPLIT, &[], &[("NSL_ROPE_BWD_BF16", "0")], "plan_split_4b0");
+    assert!(r.ok, "bf16-split build without rule 4b failed:\n{}", r.out);
     assert!(
         r.out
             .contains("(4 of the GEMMs reading them keep the eager bf16 mode's"),

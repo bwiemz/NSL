@@ -1274,7 +1274,7 @@ pub fn ad_cert_status(op: &PrimalOp) -> AdCertStatus {
         PrimalOp::MSELoss => Certified(&["mse_loss"]),
         PrimalOp::L1Loss => Certified(&["l1_loss"]),
         PrimalOp::ScaledDotProductAttention { .. } => {
-            Certified(&["sdpa", "sdpa_causal", "sdpa_scale"])
+            Certified(&["sdpa", "sdpa_causal", "sdpa_scale", "sdpa_head_views"])
         }
         PrimalOp::FlashAttentionBackwardExtract { .. } => AdjointOnly("the SDPA adjoint"),
         PrimalOp::ScaledDotProductAttentionPacked => Certified(&[
@@ -1349,7 +1349,7 @@ pub fn ad_cert_status_passthrough(name: &str) -> AdCertStatus {
         "cos" => Certified(&["cos"]),
         "sin" => Certified(&["sin"]),
         "rotate_half" => Certified(&["rotate_half"]),
-        "rope" => Certified(&["rope"]),
+        "rope" => Certified(&["rope", "rope_head_view"]),
         "swiglu" => Certified(&["swiglu", "swiglu_row"]),
         "expand" => Certified(&["expand"]),
         "sum_keepdim_last" | "mean_keepdim_last" => {

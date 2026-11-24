@@ -265,11 +265,11 @@ fn run_build_shared_multi(
         }
     };
 
-    let temp_dir = std::env::temp_dir().join(format!("nsl_shared_{}", std::process::id()));
-    if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-        nsl_log::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
-        process::exit(1);
-    }
+    let temp_dir = super::create_scratch_dir(&format!("nsl_shared_{}", std::process::id()))
+        .unwrap_or_else(|e| {
+            nsl_log::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
+            process::exit(1);
+        });
 
     let mut obj_files: Vec<PathBuf> = Vec::new();
 

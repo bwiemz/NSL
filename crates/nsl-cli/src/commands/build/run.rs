@@ -24,11 +24,11 @@ pub(crate) fn build_to_temp(
     file: &PathBuf,
     options: &nsl_codegen::CompileOptions,
 ) -> TempBuild {
-    let temp_dir = std::env::temp_dir().join(format!("nsl_run_{}", std::process::id()));
-    if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-        nsl_log::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
-        process::exit(1);
-    }
+    let temp_dir = super::create_scratch_dir(&format!("nsl_run_{}", std::process::id()))
+        .unwrap_or_else(|e| {
+            nsl_log::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
+            process::exit(1);
+        });
 
     let stem = file
         .file_stem()

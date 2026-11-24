@@ -208,11 +208,11 @@ fn run_build_single(
         let path = output.clone().unwrap_or_else(|| file.with_file_name(format!("{stem}.o")));
         (path, None)
     } else {
-        let dir = std::env::temp_dir().join(format!("nsl_build_{}", std::process::id()));
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            nsl_log::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
-            process::exit(1);
-        }
+        let dir = super::create_scratch_dir(&format!("nsl_build_{}", std::process::id()))
+            .unwrap_or_else(|e| {
+                nsl_log::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
+                process::exit(1);
+            });
         (dir.join(format!("{stem}.o")), Some(dir))
     };
 
@@ -238,14 +238,14 @@ fn run_build_single(
     crate::commands::build::emit_pass_trace();
     match nsl_codegen::linker::link(&obj_path, &exe_path) {
         Ok(()) => {
-            // Same policy as the multi-file path: a failed link leaves the
-            // scratch directory behind for debugging.
             if let Some(dir) = &scratch_dir {
                 super::cleanup_temp_dir(dir);
             }
             if !quiet { println!("Built {}", exe_path.display()); }
         }
         Err(e) => {
+            // The scratch directory goes at exit, as on every failure path;
+            // NSL_KEEP_TEMP=1 keeps it for inspecting the object.
             nsl_log::nsl_log!(ERROR, "cli", "link error: {e}");
             process::exit(1);
         }
@@ -277,11 +277,11 @@ fn run_build_multi(
         }
     };
 
-    let temp_dir = std::env::temp_dir().join(format!("nsl_build_{}", std::process::id()));
-    if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-        nsl_log::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
-        process::exit(1);
-    }
+    let temp_dir = super::create_scratch_dir(&format!("nsl_build_{}", std::process::id()))
+        .unwrap_or_else(|e| {
+            nsl_log::nsl_log!(ERROR, "cli", "error: could not create temp dir: {e}");
+            process::exit(1);
+        });
 
     // Milestone A (path-divergence fix): `--nan-analysis` ran only on
     // `run_build_single` — a multi-file build accepted the flag and emitted
@@ -720,6 +720,9 @@ fn run_build_multi(
             );
         }
         if !quiet {
+            // These objects are the command's output: keep them past exit.
+            // (Quiet callers use them as scratch, so theirs still go.)
+            super::keep_scratch_dir(&temp_dir);
             for obj in &obj_files {
                 println!("Wrote {}", obj.display());
             }
@@ -738,9 +741,8 @@ fn run_build_multi(
     match nsl_codegen::linker::link_multi(&obj_files, &exe_path) {
         Ok(()) => {
             // Remove the whole scratch directory, not just the .o files it
-            // holds — PTX, staging and other intermediates live there too and
-            // nothing else ever deletes them. A failed link deliberately
-            // leaves it behind for debugging.
+            // holds — PTX, staging and other intermediates live there too.
+            // A failed link leaves it to the exit hook (NSL_KEEP_TEMP=1 keeps it).
             super::cleanup_temp_dir(&temp_dir);
             if !quiet { println!("Built {}", exe_path.display()); }
         }

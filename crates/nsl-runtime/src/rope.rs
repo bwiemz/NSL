@@ -5,6 +5,12 @@
 //! On the GPU, one KIR kernel (`nsl_kir::kernels::rope`) reads `x` through its
 //! strides (the head view needs no copy) and the tables without expanding
 //! them; its f32 arithmetic is the decomposed graph's, rounding for rounding.
+//! When `x` is densely stored as contiguous `[b, h, s, d]` or as the head view
+//! `[b, s, h, d]` of a projection (`crate::attn_layout`), the dense-rows kernel
+//! (same arithmetic, 16-byte vector accesses) writes the result in `x`'s own
+//! layout: the head view stays a `[b, s, h, d]` buffer through RoPE, and so
+//! does its gradient through the adjoint. `NSL_ATTN_BSHD=0` keeps the
+//! strided kernel and its contiguous result.
 //! Everywhere else (the host, other ranks or dtypes, and whenever the autodiff
 //! tape is recording, which needs the ops to record themselves) it is the
 //! decomposition itself: the same values, more launches.
@@ -92,6 +98,16 @@ fn run(backward: bool, x: i64, cos: i64, sin: i64, out_dtype: Option<u16>) -> i6
         use nsl_kir::kernels::storage::Storage;
         let dir = if backward { RopeDir::Backward } else { RopeDir::Forward };
         let st = if out == DTYPE_BF16 { Storage::Bf16 } else { Storage::F32 };
+        let (tc, ts) = (NslTensor::from_ptr_ref(cos), NslTensor::from_ptr_ref(sin));
+        let layout = crate::attn_layout::head_layout(tx).filter(|_| crate::attn_layout::bshd_enabled());
+        if let Some(layout) = layout
+            && crate::cuda::storage_kernels::rope_rows_fits(tx, tc, ts)
+        {
+            if layout == crate::attn_layout::HeadLayout::Bshd {
+                crate::attn_layout::count_route(crate::attn_layout::ROUTE_ROPE);
+            }
+            return crate::cuda::storage_kernels::rope_rows(dir, x, cos, sin, st, layout);
+        }
         return crate::cuda::storage_kernels::rope(dir, x, cos, sin, st);
     }
     // The decomposition, in f32 (a bf16 x is widened, the result narrowed to
