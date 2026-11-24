@@ -124,23 +124,29 @@ function <model method '__nsl_model_Blk_forward'>(i64, i64) -> i64 <callconv> {
     sig5 = (i64, i64) -> i64 <callconv>
     sig6 = (i64, i64) -> i64 <callconv>
     sig7 = (i64) -> i64 <callconv>
-    sig8 = (i64, i64) -> i64 <callconv>
-    sig9 = (i64, i64) -> i64 <callconv>
-    sig10 = (i64, i64) -> i64 <callconv>
+    sig8 = (i64) -> i64 <callconv>
+    sig9 = (i64) -> i64 <callconv>
+    sig10 = (i64) -> i64 <callconv>
     sig11 = (i64, i64) -> i64 <callconv>
-    sig12 = () -> i64 <callconv>
-    sig13 = (i64, i64) <callconv>
-    sig14 = (i64, i64) <callconv>
-    sig15 = (i64, i64) <callconv>
-    sig16 = (i64) -> i64 <callconv>
-    sig17 = (i64, i64) -> i64 <callconv>
-    sig18 = (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 <callconv>
-    sig19 = (i64) <callconv>
-    sig20 = (i64) <callconv>
-    sig21 = (i64) <callconv>
+    sig12 = (i64, i64) -> i64 <callconv>
+    sig13 = (i64, i64) -> i64 <callconv>
+    sig14 = (i64, i64) -> i64 <callconv>
+    sig15 = () -> i64 <callconv>
+    sig16 = (i64, i64) <callconv>
+    sig17 = (i64, i64) <callconv>
+    sig18 = (i64, i64) <callconv>
+    sig19 = (i64) -> i64 <callconv>
+    sig20 = (i64, i64) -> i64 <callconv>
+    sig21 = (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 <callconv>
     sig22 = (i64) <callconv>
     sig23 = (i64) <callconv>
     sig24 = (i64) <callconv>
+    sig25 = (i64) <callconv>
+    sig26 = (i64) <callconv>
+    sig27 = (i64) <callconv>
+    sig28 = (i64) <callconv>
+    sig29 = (i64) <callconv>
+    sig30 = (i64) <callconv>
     fn0 = nsl_tensor_rmsnorm sig0
     fn1 = nsl_tensor_matmul sig1
     fn2 = nsl_tensor_matmul sig2
@@ -148,24 +154,30 @@ function <model method '__nsl_model_Blk_forward'>(i64, i64) -> i64 <callconv> {
     fn4 = nsl_sqrt sig4
     fn5 = nsl_sdpa_expand_kv sig5
     fn6 = nsl_sdpa_expand_kv sig6
-    fn7 = nsl_tensor_zeros_like sig7
-    fn8 = nsl_tensor_shape_dim sig8
-    fn9 = nsl_tensor_shape_dim sig9
-    fn10 = nsl_tensor_shape_dim sig10
+    fn7 = nsl_tensor_contiguous sig7
+    fn8 = nsl_tensor_contiguous sig8
+    fn9 = nsl_tensor_contiguous sig9
+    fn10 = nsl_tensor_zeros_like sig10
     fn11 = nsl_tensor_shape_dim sig11
-    fn12 = nsl_list_new sig12
-    fn13 = nsl_list_push sig13
-    fn14 = nsl_list_push sig14
-    fn15 = nsl_list_push sig15
-    fn16 = nsl_tensor_zeros sig16
-    fn17 = nsl_tensor_to_device sig17
-    fn18 = nsl_flash_attention sig18
-    fn19 = nsl_tensor_free_transient sig19
-    fn20 = nsl_tensor_free_transient sig20
-    fn21 = nsl_tensor_free_if_valid sig21
-    fn22 = nsl_tensor_free_if_valid sig22
-    fn23 = nsl_tensor_free_if_valid sig23
-    fn24 = nsl_tensor_free_if_valid sig24
+    fn12 = nsl_tensor_shape_dim sig12
+    fn13 = nsl_tensor_shape_dim sig13
+    fn14 = nsl_tensor_shape_dim sig14
+    fn15 = nsl_list_new sig15
+    fn16 = nsl_list_push sig16
+    fn17 = nsl_list_push sig17
+    fn18 = nsl_list_push sig18
+    fn19 = nsl_tensor_zeros sig19
+    fn20 = nsl_tensor_to_device sig20
+    fn21 = nsl_flash_attention sig21
+    fn22 = nsl_tensor_free_transient sig22
+    fn23 = nsl_tensor_free_transient sig23
+    fn24 = nsl_tensor_free_transient sig24
+    fn25 = nsl_tensor_free_transient sig25
+    fn26 = nsl_tensor_free_transient sig26
+    fn27 = nsl_tensor_free_if_valid sig27
+    fn28 = nsl_tensor_free_if_valid sig28
+    fn29 = nsl_tensor_free_if_valid sig29
+    fn30 = nsl_tensor_free_if_valid sig30
 
 block0(v0: i64, v1: i64):
     v2 = load.i64 notrap aligned v0
@@ -193,58 +205,67 @@ block0(v0: i64, v1: i64):
     v24 = icmp ne v19, v23  ; v23 = 0
     v25 = select v24, v19, v13
     v26 = call fn7(v7)
-    v27 = symbol_value.i64 gv0
-    v28 = symbol_value.i64 gv1
-    v29 = iconst.i64 64
-    v30 = iconst.i64 64
-    v31 = iconst.i64 9216
-    v32 = iconst.i64 1
-    v33 = iconst.i64 0
-    v34 = fdemote.f32 v17
-    v35 = bitcast.i32 v34
-    v36 = uextend.i64 v35
-    v37 = iconst.i64 0
-    v38 = iconst.i64 1
-    v39 = iconst.i64 2
-    v40 = iconst.i64 3
-    v41 = call fn8(v7, v37)  ; v37 = 0
-    v42 = call fn9(v7, v38)  ; v38 = 1
-    v43 = call fn10(v7, v39)  ; v39 = 2
-    v44 = call fn11(v7, v40)  ; v40 = 3
-    v45 = call fn12()
-    call fn13(v45, v41)
-    v46 = iconst.i64 0
-    call fn14(v45, v42)
-    v47 = iconst.i64 0
-    call fn15(v45, v43)
-    v48 = iconst.i64 0
-    v49 = call fn16(v45)
-    v50 = iconst.i64 1
-    v51 = call fn17(v49, v50)  ; v50 = 1
-    v52 = iconst.i64 0
-    v53 = iconst.i64 0
-    v54 = call fn18(v7, v22, v25, v26, v51, v36, v41, v42, v43, v44, v33, v33, v33, v33, v33, v33, v33, v33, v31, v27, v28, v29, v30, v32, v52, v53)  ; v33 = 0, v33 = 0, v33 = 0, v33 = 0, v33 = 0, v33 = 0, v33 = 0, v33 = 0, v31 = 9216, v29 = 64, v30 = 64, v32 = 1, v52 = 0, v53 = 0
+    v27 = call fn8(v22)
+    v28 = call fn9(v25)
+    v29 = call fn10(v26)
+    v30 = symbol_value.i64 gv0
+    v31 = symbol_value.i64 gv1
+    v32 = iconst.i64 64
+    v33 = iconst.i64 64
+    v34 = iconst.i64 9216
+    v35 = iconst.i64 1
+    v36 = iconst.i64 0
+    v37 = fdemote.f32 v17
+    v38 = bitcast.i32 v37
+    v39 = uextend.i64 v38
+    v40 = iconst.i64 0
+    v41 = iconst.i64 1
+    v42 = iconst.i64 2
+    v43 = iconst.i64 3
+    v44 = call fn11(v26, v40)  ; v40 = 0
+    v45 = call fn12(v26, v41)  ; v41 = 1
+    v46 = call fn13(v26, v42)  ; v42 = 2
+    v47 = call fn14(v26, v43)  ; v43 = 3
+    v48 = call fn15()
+    call fn16(v48, v44)
+    v49 = iconst.i64 0
+    call fn17(v48, v45)
+    v50 = iconst.i64 0
+    call fn18(v48, v46)
+    v51 = iconst.i64 0
+    v52 = call fn19(v48)
+    v53 = iconst.i64 1
+    v54 = call fn20(v52, v53)  ; v53 = 1
     v55 = iconst.i64 0
-    v56 = icmp ne v54, v55  ; v55 = 0
-    brif v56, block2, block1
+    v56 = iconst.i64 0
+    v57 = call fn21(v26, v27, v28, v29, v54, v39, v44, v45, v46, v47, v36, v36, v36, v36, v36, v36, v36, v36, v34, v30, v31, v32, v33, v35, v55, v56)  ; v36 = 0, v36 = 0, v36 = 0, v36 = 0, v36 = 0, v36 = 0, v36 = 0, v36 = 0, v34 = 9216, v32 = 64, v33 = 64, v35 = 1, v55 = 0, v56 = 0
+    v58 = iconst.i64 0
+    v59 = icmp ne v57, v58  ; v58 = 0
+    brif v59, block2, block1
 
 block2:
     trap user3
 
 block1:
-    call fn19(v18)
-    v57 = iconst.i64 0
-    call fn20(v19)
-    v58 = iconst.i64 0
-    call fn21(v10)
-    v59 = iconst.i64 0
-    call fn22(v7)
+    call fn22(v26)
     v60 = iconst.i64 0
-    call fn23(v13)
+    call fn23(v27)
     v61 = iconst.i64 0
-    call fn24(v4)
+    call fn24(v28)
     v62 = iconst.i64 0
-    return v26
+    call fn25(v18)
+    v63 = iconst.i64 0
+    call fn26(v19)
+    v64 = iconst.i64 0
+    call fn27(v10)
+    v65 = iconst.i64 0
+    call fn28(v7)
+    v66 = iconst.i64 0
+    call fn29(v13)
+    v67 = iconst.i64 0
+    call fn30(v4)
+    v68 = iconst.i64 0
+    return v29
 }
 
 --- IR: model method '__nsl_model_Net_forward' ---

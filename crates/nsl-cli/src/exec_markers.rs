@@ -278,6 +278,12 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
         "the flash-attention backward ran",
     ),
     m(
+        "[attn-layout]",
+        &["crates/nsl-runtime/src/attn_layout.rs"],
+        "the [b, s, h, d] head layout was kept: RoPE wrote it, or the tensor-core attention forward or \
+         backward read and wrote it in place",
+    ),
+    m(
         "[tied-embed]",
         &["crates/nsl-codegen/src/wengert_lower.rs"],
         "a tied embedding's gradient was planned in place: the LM head's dW GEMMs and the \
@@ -593,6 +599,7 @@ pub mod tokens {
     pub const PASS_BUS: &str = "[pass-bus]";
     pub const FLASH_BWD: &str = "[flash-bwd]";
     pub const TIED_EMBED: &str = "[tied-embed]";
+    pub const ATTN_LAYOUT: &str = "[attn-layout]";
     pub const ARENA: &str = "[arena]";
     pub const GPU_MEM: &str = "[gpu-mem]";
     pub const GPU_LAUNCH_COUNT: &str = "[nsl-gpu-launch-count]";
@@ -635,6 +642,11 @@ pub struct NegativeNeedle {
 /// loudly when its marker rots and needs no entry here; a negative one cannot
 /// fail at all, so each is pinned.
 pub const NEGATIVE_NEEDLES: &[NegativeNeedle] = &[
+    NegativeNeedle {
+        test: "crates/nsl-cli/tests/attn_layout_gate.rs",
+        asserts: "main's computation (NSL_ATTN_BSHD=0) keeps no [b, s, h, d] head layout",
+        parts: &[("[attn-layout]", "crates/nsl-runtime/src/attn_layout.rs")],
+    },
     NegativeNeedle {
         test: "crates/nsl-cli/tests/bf16_activation_storage_gate.rs",
         asserts: "a program without precision=\"bf16\" plans no bf16 activation storage",

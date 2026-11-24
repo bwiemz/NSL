@@ -1,9 +1,10 @@
 //! Launchers for the tensor-core flash attention the runtime builds for
 //! itself (`nsl_kir::kernels::flash_attn`): the training path's
-//! `scaled_dot_product_attention` forward and backward on f32
-//! `[batch, heads, seq, head_dim]` tensors, head_dim 64 or 128, causal or
-//! not, K/V with `kv_heads` dividing `heads` (grouped-query attention without
-//! expanding K/V), any sequence length.
+//! `scaled_dot_product_attention` forward and backward on f32 or bf16
+//! `[batch, heads, seq, head_dim]` tensors stored contiguous or in the
+//! `[batch, seq, heads, head_dim]` attention layout (`crate::attn_layout`),
+//! head_dim 64 or 128, causal or not, K/V with `kv_heads` dividing `heads`
+//! (grouped-query attention without expanding K/V), any sequence length.
 //!
 //! The kernels and their precision contract are documented in
 //! `nsl_kir::kernels::flash_attn`. This module builds each variant's PTX
@@ -31,7 +32,7 @@ struct Built {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Which {
     Fwd(FwdConfig),
-    Pre(u32, nsl_kir::kernels::storage::Storage),
+    Pre(u32, nsl_kir::kernels::storage::Storage, bool),
     Dq(BwdConfig),
     Dkdv(BwdConfig),
 }
@@ -43,8 +44,8 @@ fn built(which: Which) -> &'static Built {
     guard.entry(which).or_insert_with(|| {
         let (ptx, name) = match which {
             Which::Fwd(c) => (nsl_kir::kernels::flash_attn::fwd::ptx(c), c.kernel_name()),
-            Which::Pre(hd, io) => {
-                let c = BwdConfig::pre_only(hd).with_io(io);
+            Which::Pre(hd, io, bshd) => {
+                let c = BwdConfig::pre_only(hd).with_io(io).with_bshd(bshd);
                 (kbwd::pre_ptx(c), c.pre_kernel_name())
             }
             Which::Dq(c) => (kbwd::dq_ptx(c), c.dq_kernel_name()),
@@ -105,6 +106,14 @@ pub(crate) fn supports(batch: usize, head_dim: usize, heads: usize, kv_heads: us
         && b * h <= MAX_GRID_Y
 }
 
+/// Whether the `[batch, seq, heads, head_dim]` kernels serve this shape:
+/// [`supports`], and a batch's `seq · heads · head_dim` elements (Q's and
+/// K/V's) within `u32` (the kernels step between positions in 32 bits).
+pub(crate) fn supports_bshd(batch: usize, head_dim: usize, heads: usize, kv_heads: usize, seq: usize) -> bool {
+    let per_batch = |h: usize| (seq as u64) * (h as u64) * (head_dim as u64) < u32::MAX as u64;
+    supports(batch, head_dim, heads, kv_heads, seq) && per_batch(heads) && per_batch(kv_heads)
+}
+
 /// Device pointers and shape of one attention problem. `q`/`o` are
 /// `[batch, heads, seq, head_dim]`, `k`/`v` `[batch, kv_heads, seq,
 /// head_dim]`, `lse` `[batch, heads, seq]`, all f32 and contiguous.
@@ -134,16 +143,39 @@ pub(crate) fn forward(a: &FwdLaunch) -> CUresult {
     forward_io(a, nsl_kir::kernels::storage::Storage::F32)
 }
 
+/// Whether causal launches use the heaviest-first grid order
+/// ([`FwdConfig::lpt`], [`BwdConfig::lpt`]). `NSL_TC_ATTN_LPT=0` restores the
+/// tile-major order (the same per-CTA work and results, dispatched in a
+/// different order); read once.
+fn lpt_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NSL_TC_ATTN_LPT").ok().as_deref() != Some("0"))
+}
+
+/// The heaviest-first grid puts the tile count in `gridDim.y`.
+fn lpt_fits(tiles: u32) -> bool {
+    u64::from(tiles) <= MAX_GRID_Y
+}
+
 /// [`forward`] with Q, K, V and O stored as `io` (bf16: option (a) of bf16
 /// activation storage; the log-sum-exp stays f32).
 pub(crate) fn forward_io(a: &FwdLaunch, io: nsl_kir::kernels::storage::Storage) -> CUresult {
-    forward_with(FwdConfig::new(a.head_dim as u32, a.causal).with_io(io), a)
+    forward_io_layout(a, io, false)
+}
+
+/// [`forward_io`] with every operand in the `[batch, seq, heads, head_dim]`
+/// layout when `bshd` ([`supports_bshd`] must hold).
+pub(crate) fn forward_io_layout(a: &FwdLaunch, io: nsl_kir::kernels::storage::Storage, bshd: bool) -> CUresult {
+    let cfg = FwdConfig::new(a.head_dim as u32, a.causal).with_io(io).with_bshd(bshd);
+    let lpt = lpt_enabled() && lpt_fits((a.seq as u32).div_ceil(cfg.block_m()));
+    forward_with(cfg.with_lpt(lpt), a)
 }
 
 /// [`forward`] with an explicit tiling (`cfg` must match `a`'s head_dim and
 /// causality).
 pub(crate) fn forward_with(cfg: FwdConfig, a: &FwdLaunch) -> CUresult {
     debug_assert!(supports(a.batch, a.head_dim, a.heads, a.kv_heads, a.seq));
+    debug_assert!(!cfg.bshd || supports_bshd(a.batch, a.head_dim, a.heads, a.kv_heads, a.seq));
     debug_assert!(cfg.head_dim as usize == a.head_dim && cfg.causal == a.causal);
     let grid = cfg.grid(a.batch as u32, a.heads as u32, a.seq as u32);
     let (mut q, mut k, mut v, mut o, mut lse) = (a.q, a.k, a.v, a.o, a.lse);
@@ -204,7 +236,18 @@ pub(crate) fn backward(a: &BwdLaunch) -> CUresult {
 
 /// [`backward`] with Q, K, V, O, dO, dQ, dK and dV stored as `io`.
 pub(crate) fn backward_io(a: &BwdLaunch, io: nsl_kir::kernels::storage::Storage) -> CUresult {
-    backward_with(BwdConfig::new(a.head_dim as u32, a.causal).with_io(io), a, [true, true, true])
+    backward_io_layout(a, io, false)
+}
+
+/// [`backward_io`] with every operand in the `[batch, seq, heads, head_dim]`
+/// layout when `bshd` ([`supports_bshd`] must hold).
+pub(crate) fn backward_io_layout(a: &BwdLaunch, io: nsl_kir::kernels::storage::Storage, bshd: bool) -> CUresult {
+    let cfg = BwdConfig::new(a.head_dim as u32, a.causal).with_io(io).with_bshd(bshd);
+    let seq = a.seq as u32;
+    let lpt = lpt_enabled()
+        && lpt_fits(seq.div_ceil(cfg.dq_block_m()))
+        && lpt_fits(seq.div_ceil(cfg.dkdv_block_n()));
+    backward_with(cfg.with_lpt(lpt), a, [true, true, true])
 }
 
 /// [`backward`] with explicit tilings, launching only the kernels `run`
@@ -212,6 +255,7 @@ pub(crate) fn backward_io(a: &BwdLaunch, io: nsl_kir::kernels::storage::Storage)
 /// by one).
 pub(crate) fn backward_with(cfg: BwdConfig, a: &BwdLaunch, run: [bool; 3]) -> CUresult {
     debug_assert!(supports(a.batch, a.head_dim, a.heads, a.kv_heads, a.seq));
+    debug_assert!(!cfg.bshd || supports_bshd(a.batch, a.head_dim, a.heads, a.kv_heads, a.seq));
     debug_assert!(cfg.head_dim as usize == a.head_dim && cfg.causal == a.causal);
     let rows = (a.batch * a.heads * a.seq) as u32;
 
@@ -228,8 +272,12 @@ pub(crate) fn backward_with(cfg: BwdConfig, a: &BwdLaunch, run: [bool; 3]) -> CU
     if run[0] {
         // gmax holds a running maximum: it must start at zero.
         inner::memset_d8(a.gmax as *mut c_void, a.batch * a.heads * 4);
-        let pre_args = [p(&mut dout), p(&mut o), p(&mut dvec), p(&mut gmax), u(&mut rows_arg), u(&mut seq)];
-        let rc = launch(Which::Pre(cfg.head_dim, cfg.io), cfg.pre_grid(rows), cfg.pre_threads(), &pre_args, 0);
+        let mut heads_arg = a.heads as u32;
+        let mut pre_args = vec![p(&mut dout), p(&mut o), p(&mut dvec), p(&mut gmax), u(&mut rows_arg), u(&mut seq)];
+        if cfg.bshd {
+            pre_args.push(u(&mut heads_arg));
+        }
+        let rc = launch(Which::Pre(cfg.head_dim, cfg.io, cfg.bshd), cfg.pre_grid(rows), cfg.pre_threads(), &pre_args, 0);
         if rc != CUresult::CUDA_SUCCESS {
             return rc;
         }
@@ -802,6 +850,279 @@ pub(crate) mod tests {
         }
     }
 
+    /// Every output of one forward and backward with explicit kernel
+    /// configurations, as the raw bytes the kernels wrote.
+    pub(crate) struct RawRun {
+        pub o: Vec<u8>,
+        pub lse: Vec<u8>,
+        pub dq: Vec<u8>,
+        pub dk: Vec<u8>,
+        pub dv: Vec<u8>,
+    }
+
+    /// Forward (`fcfg`) then backward (`bcfg`) on operands given as raw bytes
+    /// in `bcfg.io` storage (the backward reads the forward's O and lse).
+    pub(crate) fn raw_run(sh: Shape, fcfg: FwdConfig, bcfg: BwdConfig, q: &[u8], k: &[u8], v: &[u8], dout: &[u8]) -> RawRun {
+        let w = bcfg.io.bytes();
+        let n_q = sh.b * sh.h * sh.s * sh.d;
+        let n_kv = sh.b * sh.kvh * sh.s * sh.d;
+        let n_l = sh.b * sh.h * sh.s;
+        let up = |bytes: &[u8]| {
+            let p = inner::alloc_managed(bytes.len().max(1));
+            inner::memcpy_htod(p, bytes.as_ptr() as *const c_void, bytes.len());
+            p
+        };
+        let fresh = |n: usize| {
+            let p = inner::alloc_managed(n.max(1));
+            inner::memset_d8_value(p, 0xFF, n.max(1));
+            p
+        };
+        let (qd, kd, vd, dod) = (up(q), up(k), up(v), up(dout));
+        let (od, ld) = (fresh(n_q * w), fresh(n_l * 4));
+        let (dqd, dkd, dvd) = (fresh(n_q * w), fresh(n_kv * w), fresh(n_kv * w));
+        let (dvec, gmax) = (fresh(n_l * 4), fresh(sh.b * sh.h * 4));
+        let scale = 1.0 / (sh.d as f32).sqrt();
+        let rc = forward_with(
+            fcfg,
+            &FwdLaunch {
+                q: qd as u64, k: kd as u64, v: vd as u64, o: od as u64, lse: ld as u64,
+                batch: sh.b, heads: sh.h, kv_heads: sh.kvh, seq: sh.s, head_dim: sh.d, scale, causal: sh.causal,
+            },
+        );
+        assert_eq!(rc, CUresult::CUDA_SUCCESS, "{sh:?} forward {}", fcfg.kernel_name());
+        let rc = backward_with(
+            bcfg,
+            &BwdLaunch {
+                q: qd as u64, k: kd as u64, v: vd as u64, o: od as u64, lse: ld as u64, dout: dod as u64,
+                dq: dqd as u64, dk: dkd as u64, dv: dvd as u64, dvec: dvec as u64, gmax: gmax as u64,
+                batch: sh.b, heads: sh.h, kv_heads: sh.kvh, seq: sh.s, head_dim: sh.d, scale, causal: sh.causal,
+            },
+            [true, true, true],
+        );
+        assert_eq!(rc, CUresult::CUDA_SUCCESS, "{sh:?} backward {}", bcfg.dkdv_kernel_name());
+        assert_eq!(unsafe { cudarc::driver::sys::cuCtxSynchronize() }, CUresult::CUDA_SUCCESS, "{sh:?}");
+        let get = |p: *mut c_void, n: usize| {
+            let mut out = vec![0u8; n];
+            inner::memcpy_dtoh(out.as_mut_ptr() as *mut c_void, p as *const c_void, n);
+            out
+        };
+        let r = RawRun {
+            o: get(od, n_q * w),
+            lse: get(ld, n_l * 4),
+            dq: get(dqd, n_q * w),
+            dk: get(dkd, n_kv * w),
+            dv: get(dvd, n_kv * w),
+        };
+        for p in [qd, kd, vd, dod, od, ld, dqd, dkd, dvd, dvec, gmax] {
+            inner::free_managed(p);
+        }
+        r
+    }
+
+    /// `x` (f32 values) as raw bytes in `io` storage (bf16: rounded to nearest even).
+    pub(crate) fn to_bytes(x: &[f32], io: nsl_kir::kernels::storage::Storage) -> Vec<u8> {
+        match io {
+            nsl_kir::kernels::storage::Storage::F32 => x.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            nsl_kir::kernels::storage::Storage::Bf16 => x.iter().flat_map(|&v| bf16_bits(v).to_le_bytes()).collect(),
+        }
+    }
+
+    /// The heaviest-first grid order changes which CTA is dispatched when and
+    /// nothing else: forward, dQ and dK/dV give the same bits as the
+    /// tile-major order, with grouped K/V, ragged tails, both head dims and
+    /// both storages, at realistic gradient magnitudes. Causal only (without
+    /// causal masking there is no such variant).
+    #[test]
+    #[ignore = "requires a CUDA GPU; run with --features cuda -- --ignored"]
+    fn the_lpt_grid_order_gives_the_same_bits() {
+        if !gpu() {
+            return;
+        }
+        use nsl_kir::kernels::storage::Storage;
+        let cases = [
+            (Shape { b: 2, h: 8, kvh: 2, s: 333, d: 64, causal: true }, Storage::F32),
+            (Shape { b: 2, h: 8, kvh: 2, s: 256, d: 64, causal: true }, Storage::Bf16),
+            (Shape { b: 1, h: 4, kvh: 4, s: 200, d: 128, causal: true }, Storage::F32),
+            (Shape { b: 3, h: 6, kvh: 3, s: 130, d: 128, causal: true }, Storage::Bf16),
+        ];
+        for (n, (sh, io)) in cases.into_iter().enumerate() {
+            let mut rng = Lcg(0x1b7 + n as u64);
+            let q = to_bytes(&rng.vec(sh.b * sh.h * sh.s * sh.d, 1.0), io);
+            let k = to_bytes(&rng.vec(sh.b * sh.kvh * sh.s * sh.d, 1.0), io);
+            let v = to_bytes(&rng.vec(sh.b * sh.kvh * sh.s * sh.d, 1.0), io);
+            let dout = to_bytes(&rng.vec(sh.b * sh.h * sh.s * sh.d, 1e-6), io);
+            let f = FwdConfig::new(sh.d as u32, sh.causal).with_io(io);
+            let b = BwdConfig::new(sh.d as u32, sh.causal).with_io(io);
+            let tile_major = raw_run(sh, f, b, &q, &k, &v, &dout);
+            let lpt = raw_run(sh, f.with_lpt(true), b.with_lpt(true), &q, &k, &v, &dout);
+            assert!(f.with_lpt(true).lpt && b.with_lpt(true).lpt);
+            for (what, x, y) in [
+                ("O", &tile_major.o, &lpt.o),
+                ("lse", &tile_major.lse, &lpt.lse),
+                ("dQ", &tile_major.dq, &lpt.dq),
+                ("dK", &tile_major.dk, &lpt.dk),
+                ("dV", &tile_major.dv, &lpt.dv),
+            ] {
+                assert!(x.iter().any(|&byte| byte != 0xFF), "{sh:?} {what}: unwritten");
+                assert!(x == y, "{sh:?} {io:?} {what}: the heaviest-first order changed the result");
+            }
+        }
+    }
+
+    /// `x` (`[b, heads, s, d]` contiguous, `w`-byte elements) stored
+    /// `[b, s, heads, d]` instead (`to_bshd`), or back (`!to_bshd`).
+    pub(crate) fn permute_heads(x: &[u8], b: usize, heads: usize, s: usize, d: usize, w: usize, to_bshd: bool) -> Vec<u8> {
+        let mut out = vec![0u8; x.len()];
+        let row = d * w;
+        for bi in 0..b {
+            for hi in 0..heads {
+                for si in 0..s {
+                    let bhsd = ((bi * heads + hi) * s + si) * row;
+                    let bshd = ((bi * s + si) * heads + hi) * row;
+                    let (from, to) = if to_bshd { (bhsd, bshd) } else { (bshd, bhsd) };
+                    out[to..to + row].copy_from_slice(&x[from..from + row]);
+                }
+            }
+        }
+        out
+    }
+
+    /// The `[b, s, h, d]` kernels are the contiguous kernels with other
+    /// addresses: on the same values stored the other way, every output
+    /// (O, dQ, dK, dV in the operands' layout; the log-sum-exp is `[b, h, s]`
+    /// in both) is the same bits, with grouped K/V, ragged tails, both head
+    /// dims, causal or not, f32 and bf16, in either grid order.
+    #[test]
+    #[ignore = "requires a CUDA GPU; run with --features cuda -- --ignored"]
+    fn the_bshd_kernels_are_the_contiguous_kernels_bit_for_bit() {
+        if !gpu() {
+            return;
+        }
+        use nsl_kir::kernels::storage::Storage;
+        let cases = [
+            (Shape { b: 2, h: 8, kvh: 2, s: 333, d: 64, causal: true }, Storage::Bf16, true),
+            (Shape { b: 2, h: 8, kvh: 2, s: 256, d: 64, causal: true }, Storage::F32, false),
+            (Shape { b: 1, h: 4, kvh: 4, s: 200, d: 128, causal: true }, Storage::Bf16, true),
+            (Shape { b: 3, h: 6, kvh: 3, s: 130, d: 128, causal: false }, Storage::F32, false),
+            (Shape { b: 2, h: 4, kvh: 1, s: 77, d: 64, causal: false }, Storage::Bf16, false),
+            (Shape { b: 1, h: 2, kvh: 2, s: 1, d: 64, causal: true }, Storage::F32, true),
+        ];
+        for (n, (sh, io, lpt)) in cases.into_iter().enumerate() {
+            assert!(supports_bshd(sh.b, sh.d, sh.h, sh.kvh, sh.s));
+            let w = io.bytes();
+            let mut rng = Lcg(0xb5d + n as u64);
+            let q = to_bytes(&rng.vec(sh.b * sh.h * sh.s * sh.d, 1.0), io);
+            let k = to_bytes(&rng.vec(sh.b * sh.kvh * sh.s * sh.d, 1.0), io);
+            let v = to_bytes(&rng.vec(sh.b * sh.kvh * sh.s * sh.d, 1.0), io);
+            let dout = to_bytes(&rng.vec(sh.b * sh.h * sh.s * sh.d, 1e-6), io);
+            let f = FwdConfig::new(sh.d as u32, sh.causal).with_io(io).with_lpt(lpt);
+            let b = BwdConfig::new(sh.d as u32, sh.causal).with_io(io).with_lpt(lpt);
+            let plain = raw_run(sh, f, b, &q, &k, &v, &dout);
+            let qh = |x: &[u8], to: bool| permute_heads(x, sh.b, sh.h, sh.s, sh.d, w, to);
+            let kh = |x: &[u8], to: bool| permute_heads(x, sh.b, sh.kvh, sh.s, sh.d, w, to);
+            let bshd = raw_run(sh, f.with_bshd(true), b.with_bshd(true), &qh(&q, true), &kh(&k, true), &kh(&v, true), &qh(&dout, true));
+            for (what, x, y) in [
+                ("O", plain.o.clone(), qh(&bshd.o, false)),
+                ("lse", plain.lse.clone(), bshd.lse.clone()),
+                ("dQ", plain.dq.clone(), qh(&bshd.dq, false)),
+                ("dK", plain.dk.clone(), kh(&bshd.dk, false)),
+                ("dV", plain.dv.clone(), kh(&bshd.dv, false)),
+            ] {
+                assert!(x.iter().any(|&byte| byte != 0xFF), "{sh:?} {what}: unwritten");
+                assert!(x == y, "{sh:?} {io:?} lpt={lpt} {what}: the [b, s, h, d] kernels changed the result");
+            }
+        }
+    }
+
+    /// The runtime entry points with operands in the attention layout: the
+    /// head views `x.reshape([b, s, h, d]).transpose(1, 2)` reach the
+    /// tensor-core kernels in place, the output and the gradients come back
+    /// as such views (so `.transpose(1, 2).reshape([b, s, h·d])` needs no
+    /// copy), and every value is the contiguous call's, bit for bit. With Q
+    /// contiguous the call computes contiguous and copies the views.
+    #[test]
+    #[ignore = "requires a CUDA GPU; run with --features cuda -- --ignored"]
+    fn tc_ffi_reads_and_writes_the_bshd_layout() {
+        if !gpu() || !crate::attn_layout::bshd_enabled() {
+            return;
+        }
+        use crate::attn_layout::{head_layout, route_count, HeadLayout, ROUTE_BWD, ROUTE_FWD};
+        use crate::tensor::NslTensor;
+        let sh = Shape { b: 2, h: 4, kvh: 2, s: 150, d: 64, causal: true };
+        let mut rng = Lcg(4242);
+        let q = rng.vec(sh.b * sh.h * sh.s * sh.d, 1.0);
+        let k = rng.vec(sh.b * sh.kvh * sh.s * sh.d, 1.0);
+        let v = rng.vec(sh.b * sh.kvh * sh.s * sh.d, 1.0);
+        let dout = rng.vec(sh.b * sh.h * sh.s * sh.d, 1e-6);
+        let scale = 1.0f32 / (sh.d as f32).sqrt();
+        let (b, h, kvh, s, d) = (sh.b as i64, sh.h as i64, sh.kvh as i64, sh.s as i64, sh.d as i64);
+        let bytes = |x: &[f32]| x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+        let floats = |x: Vec<u8>| x.chunks(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<f32>>();
+        // Contiguous operands, and the same values as [b, s, h, d] head views.
+        let contiguous = |x: &[f32], heads: i64| tensor_of(&[b, heads, s, d], x);
+        let view = |x: &[f32], heads: i64| {
+            let stored = floats(permute_heads(&bytes(x), sh.b, heads as usize, sh.s, sh.d, 4, true));
+            let t = tensor_of(&[b, s, heads, d], &stored);
+            let v = crate::tensor::nsl_tensor_transpose(t, 1, 2);
+            crate::tensor::nsl_tensor_free(t);
+            assert_eq!(head_layout(NslTensor::from_ptr(v)), Some(HeadLayout::Bshd));
+            v
+        };
+        let fwd = |q: i64, k: i64, v: i64| -> (i64, i64) {
+            let list = crate::flash_attention::nsl_sdpa_fused_forward(q, k, v, scale.to_bits() as i64, 1, 0, 0, 0, 0, 0, 64, 64, 0);
+            assert_ne!(list, 0, "the fused forward declined");
+            let r = (crate::list::nsl_list_get(list, 0), crate::list::nsl_list_get(list, 1));
+            crate::list::nsl_list_free(list);
+            r
+        };
+        let bwd = |dout: i64, q: i64, k: i64, v: i64, o: i64, lse: i64| -> [i64; 3] {
+            let g = crate::flash_attention::nsl_flash_attention_backward(
+                dout, q, k, v, o, lse, scale.to_bits() as i64, b, h, s, d, 1, 0, 0, 0, 0, 0, 0, 0,
+            );
+            assert_ne!(g, 0);
+            let r = [0, 1, 2].map(|i| crate::list::nsl_list_get(g, i));
+            crate::list::nsl_list_free(g);
+            r
+        };
+        let (qc, kc, vc, dc) = (contiguous(&q, h), contiguous(&k, kvh), contiguous(&v, kvh), contiguous(&dout, h));
+        let (o_c, lse_c) = fwd(qc, kc, vc);
+        let g_c = bwd(dc, qc, kc, vc, o_c, lse_c);
+
+        let (qv, kv, vv, dv) = (view(&q, h), view(&k, kvh), view(&v, kvh), view(&dout, h));
+        let (f0, b0) = (route_count(ROUTE_FWD), route_count(ROUTE_BWD));
+        let (o_v, lse_v) = fwd(qv, kv, vv);
+        assert_eq!(head_layout(NslTensor::from_ptr(o_v)), Some(HeadLayout::Bshd), "O is not a [b, s, h, d] view");
+        assert_eq!(route_count(ROUTE_FWD), f0 + 1);
+        let g_v = bwd(dv, qv, kv, vv, o_v, lse_v);
+        assert_eq!(route_count(ROUTE_BWD), b0 + 1);
+        let n_q = sh.b * sh.h * sh.s * sh.d;
+        let n_kv = sh.b * sh.kvh * sh.s * sh.d;
+        let same = |a: i64, c: i64, n: usize, what: &str| {
+            let (x, y) = (tensor_values(a, n), tensor_values(c, n));
+            assert!(x.iter().zip(&y).all(|(p, q)| p.to_bits() == q.to_bits()), "{what} differs from the contiguous call");
+        };
+        same(o_v, o_c, n_q, "O");
+        same(lse_v, lse_c, sh.b * sh.h * sh.s, "lse");
+        for (i, (what, n)) in [("dQ", n_q), ("dK", n_kv), ("dV", n_kv)].into_iter().enumerate() {
+            assert_eq!(head_layout(NslTensor::from_ptr(g_v[i])), Some(HeadLayout::Bshd), "{what} is not a [b, s, h, d] view");
+            same(g_v[i], g_c[i], n, what);
+        }
+        // The output projection's input is a view of O: no copy.
+        let o_t = crate::tensor::nsl_tensor_transpose(o_v, 1, 2);
+        assert!(NslTensor::from_ptr(o_t).is_contiguous(), "O.transpose(1, 2) is not contiguous");
+
+        // Q contiguous, K/V views: computed contiguous, the views copied.
+        let (o_m, lse_m) = fwd(qc, kv, vv);
+        assert_eq!(head_layout(NslTensor::from_ptr(o_m)), Some(HeadLayout::Bhsd));
+        same(o_m, o_c, n_q, "O (mixed layouts)");
+        for t in [qc, kc, vc, dc, o_c, lse_c, qv, kv, vv, dv, o_v, lse_v, o_t, o_m, lse_m] {
+            crate::tensor::nsl_tensor_free(t);
+        }
+        for t in g_c.into_iter().chain(g_v) {
+            crate::tensor::nsl_tensor_free(t);
+        }
+    }
+
     #[test]
     #[ignore = "requires a CUDA GPU; run with --features cuda -- --ignored"]
     fn tc_backward_small_rows_keep_their_precision() {
@@ -1059,6 +1380,43 @@ pub(crate) mod tests {
         }
     }
 
+    /// Median GPU milliseconds of one `f()` (which may launch several
+    /// kernels), over `n` calls after 3 warm-up calls: a CUDA event pair is
+    /// recorded on the compute stream around each call.
+    pub(crate) fn gpu_ms_per_call(f: &dyn Fn() -> CUresult, n: usize) -> f64 {
+        use crate::cuda::inner::{
+            cu_event_create_checked, cu_event_destroy, cu_event_elapsed_time_raw, cu_event_record_on_current_stream,
+        };
+        for _ in 0..3 {
+            assert_eq!(f(), CUresult::CUDA_SUCCESS);
+        }
+        let evs: Vec<(u64, u64)> = (0..n)
+            .map(|_| unsafe { (cu_event_create_checked().expect("event"), cu_event_create_checked().expect("event")) })
+            .collect();
+        for &(a, b) in &evs {
+            unsafe {
+                assert_eq!(cu_event_record_on_current_stream(a), CUresult::CUDA_SUCCESS);
+                assert_eq!(f(), CUresult::CUDA_SUCCESS);
+                assert_eq!(cu_event_record_on_current_stream(b), CUresult::CUDA_SUCCESS);
+            }
+        }
+        assert_eq!(unsafe { cudarc::driver::sys::cuCtxSynchronize() }, CUresult::CUDA_SUCCESS);
+        let mut ts: Vec<f64> = evs
+            .iter()
+            .map(|&(a, b)| {
+                let mut ms = 0f32;
+                assert_eq!(unsafe { cu_event_elapsed_time_raw(&mut ms, a, b) }, CUresult::CUDA_SUCCESS);
+                unsafe {
+                    cu_event_destroy(a);
+                    cu_event_destroy(b);
+                }
+                ms as f64
+            })
+            .collect();
+        ts.sort_by(f64::total_cmp);
+        ts[n / 2]
+    }
+
     /// Kernel time per call at the production recipes' attention shapes
     /// (Coder-1B: batch 2, 32 heads, seq 2048, head_dim 64; Coder-500M:
     /// batch 2, 20 heads, seq 1024), K/V expanded to every head as the
@@ -1067,7 +1425,10 @@ pub(crate) mod tests {
     /// defaults in `FwdConfig::new` / `BwdConfig::new` come from. Prints;
     /// asserts nothing but successful launches. FLOPs: the forward's two
     /// products; dQ recomputes S and dP and forms dQ (1.5x); dK/dV forms
-    /// S, dV, dP and dK (2x).
+    /// S, dV, dP and dK (2x). Each default is also timed with the
+    /// heaviest-first grid order (`lpt`, causal only). Times are the median
+    /// GPU time per call between CUDA events recorded around each call, so a
+    /// loaded host (nslq runs at idle priority) does not inflate them.
     #[test]
     #[ignore = "diagnostic: times the tensor-core attention kernels at the production shapes"]
     fn tc_attention_kernel_times() {
@@ -1078,6 +1439,7 @@ pub(crate) mod tests {
             ("1B expanded", Shape { b: 2, h: 32, kvh: 32, s: 2048, d: 64, causal: true }),
             ("1B gqa", Shape { b: 2, h: 32, kvh: 8, s: 2048, d: 64, causal: true }),
             ("500M expanded", Shape { b: 2, h: 20, kvh: 20, s: 1024, d: 64, causal: true }),
+            ("500M gqa", Shape { b: 2, h: 20, kvh: 10, s: 1024, d: 64, causal: true }),
             ("hd128", Shape { b: 2, h: 16, kvh: 16, s: 2048, d: 128, causal: true }),
         ];
         let mut warm = true;
@@ -1129,19 +1491,7 @@ pub(crate) mod tests {
                 scale: 0.125,
                 causal: sh.causal,
             };
-            let time = |f: &dyn Fn() -> CUresult| {
-                for _ in 0..3 {
-                    assert_eq!(f(), CUresult::CUDA_SUCCESS);
-                }
-                unsafe { cudarc::driver::sys::cuCtxSynchronize() };
-                let n = 20;
-                let t0 = std::time::Instant::now();
-                for _ in 0..n {
-                    assert_eq!(f(), CUresult::CUDA_SUCCESS);
-                }
-                assert_eq!(unsafe { cudarc::driver::sys::cuCtxSynchronize() }, CUresult::CUDA_SUCCESS);
-                t0.elapsed().as_secs_f64() * 1e3 / n as f64
-            };
+            let time = |f: &dyn Fn() -> CUresult| gpu_ms_per_call(f, 20);
             if warm {
                 // Bring the clocks up (and JIT the default modules) before
                 // the first timed configuration.
@@ -1167,6 +1517,11 @@ pub(crate) mod tests {
                 let mark = if cfg == def { " (default)" } else { "" };
                 eprintln!("{label}: forward w{warps} n{block_n}: {t:.3} ms, {:.1} TFLOPS{mark}", flops / t / 1e9);
             }
+            if sh.causal {
+                let cfg = def.with_lpt(true);
+                let t = time(&|| forward_with(cfg, &fl));
+                eprintln!("{label}: forward default, lpt grid: {t:.3} ms, {:.1} TFLOPS", flops / t / 1e9);
+            }
             assert_eq!(forward(&fl), CUresult::CUDA_SUCCESS);
             let bdef = BwdConfig::new(hd, sh.causal);
             let t_pre = time(&|| backward_with(bdef, &bl, [true, false, false]));
@@ -1177,6 +1532,11 @@ pub(crate) mod tests {
                 let mark = if cfg == bdef { " (default)" } else { "" };
                 eprintln!("{label}: dQ w{warps} n{block_n}: {t:.3} ms, {:.1} TFLOPS{mark}", 1.5 * flops / t / 1e9);
             }
+            if sh.causal {
+                let cfg = bdef.with_lpt(true);
+                let t = time(&|| backward_with(cfg, &bl, [false, true, false]));
+                eprintln!("{label}: dQ default, lpt grid: {t:.3} ms, {:.1} TFLOPS", 1.5 * flops / t / 1e9);
+            }
             for &(warps, block_q) in tilings {
                 let cfg = BwdConfig { dkdv_warps: warps, dkdv_block_q: block_q, ..bdef };
                 if cfg.dkdv_smem_bytes() > nsl_kir::kernel_ir::SMEM_DYNAMIC_BUDGET {
@@ -1185,6 +1545,11 @@ pub(crate) mod tests {
                 let t = time(&|| backward_with(cfg, &bl, [false, false, true]));
                 let mark = if cfg == bdef { " (default)" } else { "" };
                 eprintln!("{label}: dK/dV w{warps} q{block_q}: {t:.3} ms, {:.1} TFLOPS{mark}", 2.0 * flops / t / 1e9);
+            }
+            if sh.causal {
+                let cfg = bdef.with_lpt(true);
+                let t = time(&|| backward_with(cfg, &bl, [false, false, true]));
+                eprintln!("{label}: dK/dV default, lpt grid: {t:.3} ms, {:.1} TFLOPS", 2.0 * flops / t / 1e9);
             }
             let tb = time(&|| backward(&bl));
             eprintln!("{label}: whole backward (defaults) {tb:.3} ms");

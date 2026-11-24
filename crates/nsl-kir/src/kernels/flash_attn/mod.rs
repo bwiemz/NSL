@@ -3,7 +3,9 @@
 //! backward), built on KIR.
 //!
 //! These kernels serve `scaled_dot_product_attention` on f32 tensors laid
-//! out `[batch, heads, seq, head_dim]` (row-major, contiguous), causal or
+//! out `[batch, heads, seq, head_dim]` (row-major, contiguous) or, in the
+//! `bshd` variants, `[batch, seq, heads, head_dim]` (the attention layout:
+//! the projections' own output, see [`bshd_head`]), causal or
 //! not, with grouped-query attention native: K and V may carry
 //! `kv_heads` heads, each shared by `heads / kv_heads` consecutive query
 //! heads. Sequence lengths need not be a multiple of any tile: every load
@@ -416,6 +418,74 @@ impl G {
         }
         acc
     }
+}
+
+/// How a kernel steps from one sequence position of a head to the next in
+/// one class of operand: by `head_dim` elements (the contiguous `[b, h, s,
+/// d]` layout, a constant) or by `heads · head_dim` (the `[b, s, h, d]`
+/// layout, a run-time value).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RowStride {
+    Const(u32),
+    Var(VarId),
+}
+
+impl RowStride {
+    /// The element offset of position `row` from the head's first element.
+    pub(crate) fn off(self, g: &mut G, row: VarId) -> VarId {
+        match self {
+            RowStride::Const(c) => g.mul_u32c(row, c),
+            RowStride::Var(v) => g.mul(row, v),
+        }
+    }
+}
+
+/// The first element of head `h` of batch `b` in the `[batch, seq, heads,
+/// head_dim]` layout, as a 64-bit element offset `((b · seq) · heads + h) ·
+/// head_dim`, and the stride between its positions (`heads · head_dim`).
+/// The u32 position offsets need `seq · heads · head_dim < 2^32` (the
+/// launcher's check).
+pub(crate) fn bshd_head(g: &mut G, b: VarId, h: VarId, heads: VarId, seq64: VarId, head_dim: u32) -> (VarId, RowStride) {
+    let b64 = g.cast(b, KirType::U64);
+    let heads64 = g.cast(heads, KirType::U64);
+    let h64 = g.cast(h, KirType::U64);
+    let bs = g.mul(b64, seq64);
+    let r = g.mul(bs, heads64);
+    let r = g.add(r, h64);
+    let hd64 = g.u64c(u64::from(head_dim));
+    let off = g.mul(r, hd64);
+    let rs = g.mul_u32c(heads, head_dim);
+    (off, RowStride::Var(rs))
+}
+
+/// The launch grid of a kernel with `tiles` sequence tiles per `rows`
+/// (`batch · heads` or `batch · kv_heads`) row: `[tiles, rows, 1]`, or with
+/// `lpt` (largest processing time first) `[rows, tiles, 1]`.
+///
+/// Under causal masking a CTA's work grows (forward, dQ) or shrinks (dK/dV)
+/// with its tile index, by up to the tile count. The kernels already map
+/// `blockIdx` so that within a row the heaviest tile comes first; but the
+/// block scheduler dispatches in `blockIdx` order, x fastest, so with x over
+/// tiles the heaviest CTAs of the last rows are dispatched only after every
+/// earlier row's light ones, and finish last. With x over rows, every row's
+/// heaviest tile is dispatched in the first wave and the lightest CTAs fill
+/// the end: the greedy longest-first schedule. It matters most for the
+/// grouped dK/dV kernel, whose CTAs each walk a whole group of query heads,
+/// so there are `heads / kv_heads` times fewer, longer ones. Which CTA does
+/// which tile is unchanged, so the results are the same bits.
+pub(crate) fn grid_order(lpt: bool, tiles: u32, rows: u32) -> [u32; 3] {
+    if lpt { [rows, tiles, 1] } else { [tiles, rows, 1] }
+}
+
+/// The `(tile, row)` block indices of a kernel launched with
+/// [`grid_order`]`(lpt, ..)`.
+pub(crate) fn tile_and_row(g: &mut G, lpt: bool) -> (VarId, VarId) {
+    let (tile_axis, row_axis) = if lpt { (1, 0) } else { (0, 1) };
+    let tile = g.var(KirType::U32);
+    g.b.emit(KirOp::BlockIdx(tile, tile_axis));
+    let row = g.var(KirType::U32);
+    g.b.emit(KirOp::BlockIdx(row, row_axis));
+    (tile, row)
 }
 
 /// The power of two that lifts a gradient whose largest magnitude has the

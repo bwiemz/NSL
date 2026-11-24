@@ -34,6 +34,9 @@
 //! 4. An adjoint GEMM is bf16 when it produces the gradient of a value whose
 //!    gradient is planned bf16 (its single reader is the `reduce_to_shape`
 //!    onto that value); otherwise f32.
+//!    4b. The RoPE adjoint of a bf16 gradient is bf16 when only GEMMs read
+//!    its result (through views): the q/k projections' input and weight
+//!    gradients, which take bf16 operands. (`NSL_ROPE_BWD_BF16=0`: f32.)
 //! 5. A transpose of a bf16 value is a bf16 view; `reduce_to_shape` of a
 //!    bf16 gradient onto a planned value of the same role is the identity.
 //! 6. Verify: every op that reads a bf16 value is one the dtype-explicit
@@ -128,6 +131,45 @@ fn is_param(prod: &HashMap<VarId, &WengertOp>, v: VarId) -> bool {
 fn matmul_of_param(prod: &HashMap<VarId, &WengertOp>, v: VarId) -> Option<VarId> {
     let op = prod.get(&v)?;
     (matches!(op.op, PrimalOp::Matmul) && op.inputs.len() == 2 && is_param(prod, op.inputs[1])).then(|| op.inputs[0])
+}
+
+/// Whether `v` is read, directly or through transposes, reshapes and
+/// copies of it, by at least one GEMM and by nothing else (a `shape` read
+/// aside): rule 4b's GEMM-ready gradient. A summed input gradient's GEMM
+/// (`matmul_acc`, `source_ad::fuse_dgrad_accumulate`) counts when `v` is one
+/// of its two GEMM operands, not its accumulator.
+fn feeds_only_gemms(rd: &HashMap<VarId, Vec<&WengertOp>>, v: VarId) -> bool {
+    let mut stack = vec![v];
+    let mut gemms = 0usize;
+    while let Some(x) = stack.pop() {
+        for r in rd.get(&x).map(Vec::as_slice).unwrap_or_default() {
+            if matches!(r.op, PrimalOp::Matmul)
+                || (is_passthrough(&r.op, "matmul_acc")
+                    && r.inputs.len() == 3
+                    && r.inputs[..2].contains(&x)
+                    && r.inputs[2] != x)
+            {
+                gemms += 1;
+            } else if is_passthrough(&r.op, "shape") {
+                continue;
+            } else if (matches!(r.op, PrimalOp::Transpose { .. })
+                || is_passthrough(&r.op, "reshape")
+                || is_passthrough(&r.op, "contiguous"))
+                && r.inputs.first() == Some(&x)
+            {
+                stack.push(r.result);
+            } else {
+                return false;
+            }
+        }
+    }
+    gemms > 0
+}
+
+/// Rule 4b's switch: `NSL_ROPE_BWD_BF16=0` at build time keeps the RoPE
+/// adjoints f32 (the plan before rule 4b).
+fn rope_grad_bf16_enabled() -> bool {
+    std::env::var("NSL_ROPE_BWD_BF16").ok().as_deref() != Some("0")
 }
 
 fn only_reader<'a>(rd: &HashMap<VarId, Vec<&'a WengertOp>>, v: VarId) -> Option<&'a WengertOp> {
@@ -453,6 +495,8 @@ struct Planner<'a> {
     /// Each recompute clone and each CCR shape stub, mapped to the primal
     /// value it stands for (see [`Planner::grad_is_bf16`]).
     stand_in: HashMap<VarId, VarId>,
+    /// Rule 4b on (see [`plan_with_params`]).
+    rope_grad_bf16: bool,
 }
 
 impl Planner<'_> {
@@ -634,7 +678,16 @@ impl Planner<'_> {
             PrimalOp::Passthrough(name) if name == "rope_backward" => {
                 // The RoPE adjoint mixes in the f32 tables, but writes the
                 // gradient of the head view: stored as rule 6 says (rule 4).
-                if in_adjoint && target().is_some_and(|t| self.grad_is_bf16(t)) {
+                // Rule 4b: a bf16 gradient whose result only GEMMs read
+                // (through the head view's adjoint views: the q/k projections'
+                // dgrad and wgrad) is written bf16, the operand those GEMMs
+                // take, instead of f32 for each GEMM to round.
+                if (in_adjoint && target().is_some_and(|t| self.grad_is_bf16(t)))
+                    || (reads_bf16
+                        && in_adjoint
+                        && self.rope_grad_bf16
+                        && feeds_only_gemms(rd_adj, op.result))
+                {
                     self.set(op, Storage::Bf16);
                 } else if reads_bf16 {
                     self.set(op, Storage::F32);
@@ -666,7 +719,7 @@ impl Planner<'_> {
 /// `adjoint` to the primal value it recomputes (empty without CCR).
 #[cfg(test)]
 pub fn plan(primal: &WengertList, adjoint: &WengertList, clones: &HashMap<VarId, VarId>) -> Result<StoragePlan, String> {
-    plan_with_params(primal, adjoint, clones, &[], &HashSet::new())
+    plan_with_params(primal, adjoint, clones, &[], &HashSet::new(), true)
 }
 
 /// [`plan`] with `params` (the `Param` VarIds of [`select_bf16_params`])
@@ -677,12 +730,17 @@ pub fn plan(primal: &WengertList, adjoint: &WengertList, clones: &HashMap<VarId,
 /// in place of its original for that value's shape, so a gradient reduced
 /// onto a stub is the original's gradient, stored as rule 6 says for the
 /// original (as for a clone).
+///
+/// `rope_grad_bf16` stores a RoPE adjoint that reads a bf16 gradient in bf16
+/// when every reader of its result, through views, is a GEMM (rule 4b);
+/// `false` keeps it f32 (`NSL_ROPE_BWD_BF16=0`).
 pub fn plan_with_params(
     primal: &WengertList,
     adjoint: &WengertList,
     clones: &HashMap<VarId, VarId>,
     stubs: &[(VarId, VarId)],
     params: &HashSet<VarId>,
+    rope_grad_bf16: bool,
 ) -> Result<StoragePlan, String> {
     let slices = find_slices(primal);
     let (attn_seeds, attn_norms) = find_attention_seeds(primal);
@@ -694,6 +752,7 @@ pub fn plan_with_params(
         param_view: params.clone(),
         clones,
         stand_in,
+        rope_grad_bf16,
     };
     pl.plan.bf16.extend(params.iter().copied());
     let prod = producers(primal);
@@ -777,7 +836,7 @@ impl Compiler<'_> {
         };
         let params: HashSet<VarId> = selected.iter().map(|&(v, _)| v).collect();
         let stubs = ccr_plan.as_ref().map_or(&[][..], |p| &p.shape_stubs[..]);
-        let planned = plan_with_params(effective_primal, adjoint, clones, stubs, &params)
+        let planned = plan_with_params(effective_primal, adjoint, clones, stubs, &params, rope_grad_bf16_enabled())
             .map_err(crate::CodegenError::new)?;
         if planned.slices == 0 && planned.attention == 0 {
             // The program's fingerprint (`act=bf16`) and runtime banner were
@@ -1158,7 +1217,7 @@ mod tests {
         use Storage::{Bf16, F32};
         for fold in [false, true] {
             let (primal, adjoint, clones, stubs) = fused_block(fold);
-            let got = plan_with_params(&primal, &adjoint, &clones, &stubs, &HashSet::new()).expect("plans");
+            let got = plan_with_params(&primal, &adjoint, &clones, &stubs, &HashSet::new(), true).expect("plans");
             assert_eq!(got.slices, 1, "fold={fold}");
             let value = if fold { 900 } else { 753 };
             let want_out: HashMap<VarId, Storage> = HashMap::from([
@@ -1176,7 +1235,7 @@ mod tests {
         // would fall back to f32: the mapping is what keeps the fold from
         // changing the plan.
         let (primal, adjoint, clones, _) = fused_block(true);
-        let got = plan_with_params(&primal, &adjoint, &clones, &[], &HashSet::new()).expect("plans");
+        let got = plan_with_params(&primal, &adjoint, &clones, &[], &HashSet::new(), true).expect("plans");
         assert!(!got.bf16.contains(&501) && got.out.get(&516) == Some(&F32), "{:?}", got.out);
     }
 
@@ -1267,7 +1326,7 @@ mod tests {
         // With the parameters stored, the accumulation reads a bf16 gradient as well as
         // the stored weight: the storage route, not the eager rule.
         let params: HashSet<VarId> = [126, 133, 136, 139].into_iter().collect();
-        let got = plan_with_params(&primal, &adjoint, &clones, &[], &params).expect("plans");
+        let got = plan_with_params(&primal, &adjoint, &clones, &[], &params, true).expect("plans");
         assert_eq!(got.out.get(&520), Some(&F32));
         assert!(!got.param_gemm.contains(&520));
     }
@@ -1302,7 +1361,7 @@ mod tests {
         let (primal, adjoint, clones) = block();
         let base = plan(&primal, &adjoint, &clones).expect("plans");
         let params: HashSet<VarId> = [126, 133, 136, 139].into_iter().collect();
-        let got = plan_with_params(&primal, &adjoint, &clones, &[], &params).expect("plans");
+        let got = plan_with_params(&primal, &adjoint, &clones, &[], &params, true).expect("plans");
         use Storage::{Bf16, F32};
         for (v, st) in [
             (504, F32),
@@ -1588,22 +1647,24 @@ mod tests {
             // reduce_to_shape of bf16 gradients: the identity onto the
             // attention output, GQA's group sums onto the KV head views
             (100, Bf16), (129, Bf16), (138, Bf16),
-            // the RoPE adjoints read bf16 dQ/dK and are followed by a view,
-            // not a reduce_to_shape: written f32
-            (144, F32), (152, F32),
+            // rule 4b: the RoPE adjoints read bf16 dQ/dK and only the k and q
+            // projections' GEMMs read their results (through the head
+            // views' adjoints): written bf16
+            (144, Bf16), (152, Bf16),
             // dgrads into the norm output f32 (summed in f32 and read by the
-            // f32 norm backward) where they read a bf16 operand (v's; q's
-            // and k's read the f32 RoPE adjoints and keep their ordinary
-            // lowering); the three wgrads f32
-            (175, F32), (178, F32), (185, F32), (192, F32),
+            // f32 norm backward), each reading a bf16 gradient; the four
+            // wgrads f32
+            (175, F32), (178, F32), (181, F32), (185, F32), (188, F32), (192, F32),
         ]);
         assert_eq!(got.out, want_out);
         let want_bf16: HashSet<VarId> = [
             // forward: seeds, then views and copies of them, and SDPA's O
             6, 31, 33, 35, 37, 38, 40, 41, 43, 44, 52, 58, 61, 63, 64, 66, 69, 71, 72, 74, 80, 81, 84, 86,
             // backward: dO and its views, dQ/dK/dV and their views and
-            // sums, and the transposed norm output the wgrads read
-            99, 100, 101, 105, 110, 111, 112, 113, 127, 129, 132, 136, 138, 141, 162, 164, 177, 184, 191,
+            // sums, the RoPE adjoints and their views, and the transposed
+            // norm output the wgrads read
+            99, 100, 101, 105, 110, 111, 112, 113, 127, 129, 132, 136, 138, 141, 144, 152, 162, 164, 166, 168, 170,
+            172, 177, 184, 191,
         ]
         .into_iter()
         .collect();
@@ -1616,6 +1677,92 @@ mod tests {
         for v in [175, 176, 181, 182, 188, 189, 190, 217, 91, 92, 97] {
             assert!(!got.bf16.contains(&v), "VarId {v} must stay f32");
         }
+    }
+
+    /// `NSL_ROPE_BWD_BF16=0` (rule 4b off): the RoPE adjoints are written
+    /// f32 and the q/k projections' GEMMs read them as f32 values (their
+    /// ordinary lowering), the plan before rule 4b; everything else as
+    /// above. A RoPE adjoint that something other than a GEMM reads stays f32
+    /// with the rule on.
+    #[test]
+    fn rule_4b_off_or_a_non_gemm_reader_keeps_the_rope_adjoint_f32() {
+        let (primal, adjoint) = attention_block();
+        let on = plan(&primal, &adjoint, &HashMap::new()).expect("plans");
+        let off = plan_with_params(&primal, &adjoint, &HashMap::new(), &[], &HashSet::new(), false).expect("plans");
+        use Storage::{Bf16, F32};
+        for v in [144, 152] {
+            assert_eq!((on.out.get(&v), off.out.get(&v)), (Some(&Bf16), Some(&F32)), "VarId {v}");
+        }
+        // q's and k's GEMMs read only f32 values without rule 4b: no
+        // dtype-explicit lowering.
+        for v in [181, 188] {
+            assert!(!off.out.contains_key(&v), "VarId {v}");
+        }
+        for v in [144, 152, 166, 168, 170, 172] {
+            assert!(!off.bf16.contains(&v), "VarId {v} must be f32 with rule 4b off");
+        }
+        // Everything else is the same plan.
+        let strip = |p: &StoragePlan| -> (Vec<(VarId, Storage)>, Vec<VarId>) {
+            let skip = [144, 152, 166, 168, 170, 172, 181, 188];
+            let mut o: Vec<_> = p.out.iter().filter(|(v, _)| !skip.contains(v)).map(|(&v, &s)| (v, s)).collect();
+            let mut b: Vec<_> = p.bf16.iter().filter(|v| !skip.contains(v)).copied().collect();
+            o.sort_unstable_by_key(|x| x.0);
+            b.sort_unstable();
+            (o, b)
+        };
+        assert_eq!(strip(&on), strip(&off));
+        // k's adjoint also read by a non-GEMM (an elementwise op): f32.
+        let mut adj2 = adjoint.clone();
+        adj2.ops.push(op(300, PrimalOp::Mul, &[166, 166]));
+        let p2 = plan(&primal, &adj2, &HashMap::new()).expect("plans");
+        assert_eq!(p2.out.get(&144), Some(&F32));
+        assert_eq!(p2.out.get(&152), Some(&Bf16));
+    }
+
+    /// Rule 4b with the norm output's gradient summed by GEMM accumulation
+    /// (`source_ad::fuse_dgrad_accumulate`: v's dgrad, then k's and q's
+    /// accumulated onto it): the RoPE adjoints still feed only GEMMs, as the
+    /// accumulations' GEMM operands, and are written bf16; each accumulation
+    /// reads a bf16 gradient into the f32 sum. A view of q's adjoint read as
+    /// an accumulator is not a GEMM operand: q's adjoint stays f32.
+    #[test]
+    fn rule_4b_counts_a_dgrad_accumulation_as_a_gemm() {
+        use Storage::{Bf16, F32};
+        let (primal, mut adjoint) = attention_block();
+        adjoint.ops.retain(|o| ![181, 188, 190].contains(&o.result));
+        for o in adjoint.ops.iter_mut() {
+            match o.result {
+                182 => (o.op, o.inputs) = (pt("matmul_acc"), vec![168, 180, 176]),
+                189 => (o.op, o.inputs) = (pt("matmul_acc"), vec![172, 187, 182]),
+                217 => o.inputs[0] = 189,
+                _ => {}
+            }
+        }
+        let got = plan(&primal, &adjoint, &HashMap::new()).expect("plans");
+        for (v, st) in [(144, Bf16), (152, Bf16), (182, F32), (189, F32)] {
+            assert_eq!(got.out.get(&v), Some(&st), "VarId {v}");
+        }
+        assert!(!got.param_gemm.contains(&182) && !got.param_gemm.contains(&189));
+        let off = plan_with_params(
+            &primal,
+            &adjoint,
+            &HashMap::new(),
+            &[],
+            &HashSet::new(),
+            false,
+        )
+        .expect("plans");
+        assert_eq!(
+            (off.out.get(&144), off.out.get(&152)),
+            (Some(&F32), Some(&F32))
+        );
+        let mut acc = adjoint.clone();
+        acc.ops.push(op(301, pt("matmul_acc"), &[164, 187, 172]));
+        let p = plan(&primal, &acc, &HashMap::new()).expect("plans");
+        assert_eq!(
+            (p.out.get(&144), p.out.get(&152)),
+            (Some(&Bf16), Some(&F32))
+        );
     }
 
     /// The 500M recipe's attention: `dropout(Wo)` before the residual add.
@@ -1650,12 +1797,13 @@ mod tests {
             // residual add read f32 only (ordinary lowering)
             (86, F32),
             (99, Bf16), (102, F32), (100, Bf16), (129, Bf16), (138, Bf16),
-            (144, F32), (152, F32), (175, F32), (178, F32), (185, F32), (192, F32),
+            (144, Bf16), (152, Bf16), (175, F32), (178, F32), (181, F32), (185, F32), (188, F32), (192, F32),
         ]);
         assert_eq!(got.out, want_out);
         let want_bf16: HashSet<VarId> = [
             6, 31, 33, 35, 37, 38, 40, 41, 43, 44, 52, 58, 61, 63, 64, 66, 69, 71, 72, 74, 80, 81, 84,
-            99, 100, 101, 105, 110, 111, 112, 113, 127, 129, 132, 136, 138, 141, 162, 164, 177, 184, 191,
+            99, 100, 101, 105, 110, 111, 112, 113, 127, 129, 132, 136, 138, 141, 144, 152, 162, 164, 166, 168, 170,
+            172, 177, 184, 191,
         ]
         .into_iter()
         .collect();

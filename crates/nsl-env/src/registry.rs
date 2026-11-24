@@ -96,6 +96,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "Allocate via cuMemAllocAsync (driver pool), not the caching allocator; incompatible with CUDA graphs. Measured at Coder-1B: +1.2 GiB driver peak, 0.98x tok/s."
     ),
     var!(
+        "NSL_ATTN_BSHD",
+        Bool,
+        "0 only",
+        "on (RoPE and the tensor-core attention keep the [b, s, h, d] head layout)",
+        Perf,
+        Runtime,
+        "Set to 0 to make RoPE write contiguous [b, h, s, d] and the tensor-core attention copy head views to it (same values, the previous copies)."
+    ),
+    var!(
         "NSL_AUTOTUNE_FALLBACK",
         Bool,
         "any value (set, even empty; docs say 1)",
@@ -1257,6 +1266,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "Disaggregated-inference worker role for this process: router (default, monolithic), prefill, or decode."
     ),
     var!(
+        "NSL_ROPE_BWD_BF16",
+        Bool,
+        "0 only",
+        "on (precision=\"bf16\": a RoPE adjoint only GEMMs read is stored bf16)",
+        Behavior,
+        Compile,
+        "Set to 0 at build time to keep the RoPE adjoint's q/k gradients f32 under precision=\"bf16\" (each GEMM then rounds them itself)."
+    ),
+    var!(
         "NSL_RUNTIME_LIB_PATH_OVERRIDE",
         Path,
         "existing path to the nsl runtime static library; a missing path is silently ignored",
@@ -1453,6 +1471,15 @@ pub static REGISTRY: &[EnvVar] = &[
         Behavior,
         Runtime,
         "Set to 0 to serve unpacked scaled_dot_product_attention with the kernels before the tensor-core ones (f16 output, atomic dQ, CPU backward on tape AD)."
+    ),
+    var!(
+        "NSL_TC_ATTN_LPT",
+        Bool,
+        "0 only",
+        "on (causal tensor-core attention kernels dispatch their heaviest CTAs first)",
+        Perf,
+        Runtime,
+        "Set to 0 to launch the causal tensor-core attention kernels in tile-major grid order (same results, the previous CTA dispatch order)."
     ),
     var!(
         "NSL_TENSOR_TO_DESC_NULL_CHILD",

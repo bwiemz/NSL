@@ -717,6 +717,23 @@ fn base_certs() -> Vec<Cert> {
                     .collect();
                 Arr { shape: vec![1, 2, 3, 4], data }
             }), known: &[], prelude: "" },
+        // RoPE of a head view (`x.transpose(1, 2)` of a [b, s, h, d] tensor,
+        // as `nsl.nn.gqa` applies it): the rope adjoint composed with the
+        // transpose's. On the GPU the result and its gradient keep the view's
+        // [b, s, h, d] memory layout; the rules are layout-blind.
+        Cert { name: "rope_head_view", inputs: vec![inp("x", &[1, 3, 2, 4]), inp("c", &[3, 4]), inp("s", &[3, 4])],
+            expr: "rope(x.transpose(1, 2), c, s)", wrt: &["x"], out_shape: &[1, 2, 3, 4],
+            oracle: oracle!(|e| {
+                let (x, c, s) = (transpose2(get(e, "x"), 1, 2), get(e, "c"), get(e, "s"));
+                let data = (0..x.data.len())
+                    .map(|i| {
+                        let (j, row) = (i % 4, (i / 4) % 3);
+                        let partner = if j < 2 { -x.data[i + 2] } else { x.data[i - 2] };
+                        x.data[i] * c.data[row * 4 + j] + partner * s.data[row * 4 + j]
+                    })
+                    .collect();
+                Arr { shape: vec![1, 2, 3, 4], data }
+            }), known: &[], prelude: "" },
         // The fused SwiGLU: source AD rewrites `silu(x) * y` into one
         // `swiglu` op (`fuse_swiglu_forward`) with its own adjoint; the tape
         // records the silu and the multiply. The row variant broadcasts `y`,
@@ -892,6 +909,20 @@ fn base_certs() -> Vec<Cert> {
         Cert { name: "sdpa_causal", inputs: vec![inp("q", &[1, 2, 4, 8]), inp("k", &[1, 2, 4, 8]), inp("v", &[1, 2, 4, 8])],
             expr: "scaled_dot_product_attention(q, k, v, 0.35355339059327373, true)", wrt: &["q", "k", "v"], out_shape: &[1, 2, 4, 8],
             oracle: oracle!(|e| sdpa_ref(get(e, "q"), get(e, "k"), get(e, "v"), 0.35355339059327373, true)), known: &[], prelude: "" },
+        // The attention of head views (`x.transpose(1, 2)` of [b, s, h, d]
+        // tensors, as `nsl.nn.gqa` passes them): its adjoint composed with the
+        // transposes'. On the GPU these are the operands the tensor-core
+        // kernels read in place, and O/dQ/dK/dV come back in that layout.
+        Cert { name: "sdpa_head_views", inputs: vec![inp("q", &[1, 4, 2, 8]), inp("k", &[1, 4, 2, 8]), inp("v", &[1, 4, 2, 8])],
+            expr: "scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), 0.35355339059327373, true)",
+            wrt: &["q", "k", "v"], out_shape: &[1, 2, 4, 8],
+            oracle: oracle!(|e| sdpa_ref(
+                &transpose2(get(e, "q"), 1, 2),
+                &transpose2(get(e, "k"), 1, 2),
+                &transpose2(get(e, "v"), 1, 2),
+                0.35355339059327373,
+                true
+            )), known: &[], prelude: "" },
         Cert { name: "sdpa_scale", inputs: vec![inp("q", &[1, 2, 4, 8]), inp("k", &[1, 2, 4, 8]), inp("v", &[1, 2, 4, 8])],
             expr: "scaled_dot_product_attention(q, k, v, 0.9, false)", wrt: &["q", "k", "v"], out_shape: &[1, 2, 4, 8],
             oracle: oracle!(|e| sdpa_ref(get(e, "q"), get(e, "k"), get(e, "v"), 0.9, false)), known: &[], prelude: "" },
@@ -1729,14 +1760,14 @@ cert_tests! {
     neg, relu, sigmoid, tanh, exp, log, sqrt, gelu, silu, abs, clamp, cos, sin,
     transpose, transpose_3d, reshape, unsqueeze, expand, contiguous,
     rotate_half,
-    rope,
+    rope, rope_head_view,
     swiglu, swiglu_row,
     sum_all, mean_all, sum_dim, mean_dim, sum_dim_neg, sum_dim_keepdim, sum_dim_last, mean_dim_last,
     softmax_last, softmax_dim0, softmax_mid, log_softmax_last, log_softmax_dim0, log_softmax_mid,
     layernorm, layernorm_eps, rmsnorm, rmsnorm_eps, layernorm_3d, layernorm_field_eps, rmsnorm_field_eps, rmsnorm_field_eps_reused,
     embedding, gather, gather_neg, gather_dim0, gather_mid, cat_dim0, cat_dim1, cat_three, cat_neg,
     cross_entropy, mse_loss, l1_loss,
-    conv2d, sdpa, sdpa_causal, sdpa_scale,
+    conv2d, sdpa, sdpa_causal, sdpa_scale, sdpa_head_views,
     sdpa_packed, sdpa_packed_docs, sdpa_packed_batch, sdpa_packed_scale,
     cast_f64_round_trip, cast_f64_square,
     reduce_max_dim1, reduce_max_dim0, reduce_max_keepdim_last, reduce_max_keepdim_mid, reduce_max_mid,

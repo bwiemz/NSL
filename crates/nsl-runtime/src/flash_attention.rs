@@ -1075,15 +1075,15 @@ pub fn nsl_test_pin_previous_attention_kernels() {
 }
 
 /// The unpacked SDPA forward on the tensor-core kernels: `[out, lse]` as an
-/// `NslList` (out f32 `[b, h, s, d]`, lse f32 `[b, h, s]`), or `None` when
-/// the launch failed (logged once; the caller declines to the decomposed
-/// graph). The caller has checked layout, strides and shapes.
+/// `NslList` (out `[b, h, s, d]` stored in `layout` and in Q's dtype, lse
+/// f32 `[b, h, s]`), or `None` when the launch failed (logged once; the
+/// caller declines to the decomposed graph). The caller has checked shapes
+/// and put `[q, k, v]` in `layout`.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn tc_sdpa_forward(
-    q_t: &NslTensor,
-    k_t: &NslTensor,
-    v_t: &NslTensor,
+    [q_ptr, k_ptr, v_ptr]: [i64; 3],
+    layout: crate::attn_layout::HeadLayout,
     b: i64,
     h: i64,
     kv_h: i64,
@@ -1094,6 +1094,8 @@ fn tc_sdpa_forward(
 ) -> Option<i64> {
     use crate::cuda::inner;
     inner::ensure_context();
+    let (q_t, k_t, v_t) = (NslTensor::from_ptr(q_ptr), NslTensor::from_ptr(k_ptr), NslTensor::from_ptr(v_ptr));
+    let bshd = layout == crate::attn_layout::HeadLayout::Bshd;
     let total_out = (b * h * s * d) as usize;
     let total_lse = (b * h * s) as usize;
     // bf16 activation storage (option (a)): Q/K/V read as bf16, O written
@@ -1106,7 +1108,7 @@ fn tc_sdpa_forward(
     // Every element is written by the kernel: no zero-fill.
     let out_data = inner::alloc_managed(total_out * io.bytes());
     let lse_data = inner::alloc_managed(total_lse * 4);
-    let rc = crate::attention_tc::forward_io(&crate::attention_tc::FwdLaunch {
+    let rc = crate::attention_tc::forward_io_layout(&crate::attention_tc::FwdLaunch {
         q: q_t.data as u64,
         k: k_t.data as u64,
         v: v_t.data as u64,
@@ -1119,7 +1121,7 @@ fn tc_sdpa_forward(
         head_dim: d as usize,
         scale: f32::from_bits(scale_bits as u32),
         causal,
-    }, io);
+    }, io, bshd);
     let sync_rc = if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS && inner::sync_mode_enabled() {
         unsafe { cudarc::driver::sys::cuCtxSynchronize() }
     } else {
@@ -1138,7 +1140,10 @@ fn tc_sdpa_forward(
     if !SDPA_FUSED_LAUNCH_LOGGED.swap(true, Ordering::Relaxed) {
         crate::nsl_log!(INFO, "nsl", "[nsl] sdpa fused forward: launched (tensor-core kernels, head_dim={d})");
     }
-    let out_ptr = make_gpu_tensor_dtype(out_data, &[b, h, s, d], total_out, q_t.dtype);
+    if bshd {
+        crate::attn_layout::count_route(crate::attn_layout::ROUTE_FWD);
+    }
+    let out_ptr = crate::attn_layout::wrap_head_tensor(out_data, [b, h, s, d], layout, q_t.dtype, 1);
     let lse_ptr = make_gpu_tensor(lse_data, &[b, h, s], total_lse);
     let list = crate::list::nsl_list_new();
     crate::list::nsl_list_push(list, out_ptr);
@@ -1216,18 +1221,20 @@ fn tc_sdpa_backward(
     let _surface = crate::cuda::caching_allocator::SurfaceGuard::new(
         crate::cuda::caching_allocator::SurfaceTag::AttnWorkspace,
     );
-    // Canonical copies of view inputs (the kernels read stride-blind).
-    let mut temps: Vec<i64> = Vec::new();
-    let mut canon = |p: i64| -> i64 {
-        if is_canonical_row_major(NslTensor::from_ptr(p)) {
-            p
-        } else {
-            let c = crate::tensor::nsl_tensor_contiguous(p);
-            temps.push(c);
-            c
-        }
+    // Every operand in one head layout (`crate::attn_layout`): Q's when it
+    // is the `[b, s, h, d]` head view (the production path: dO arrives as the
+    // view of the output projection's dgrad, Q/K as RoPE's results, V as the
+    // projection's view, O as the forward wrote it), contiguous otherwise;
+    // an operand stored differently is copied (the kernels read raw
+    // pointers). The log-sum-exp recompute below reads contiguous f32 Q and
+    // K, so without a saved log-sum-exp the layout is contiguous.
+    let layout = if saved_lse.is_some() {
+        crate::attn_layout::tc_layout(NslTensor::from_ptr(q_ptr), b as i64, h as i64, kv_h as i64, s as i64, d as i64)
+    } else {
+        crate::attn_layout::HeadLayout::Bhsd
     };
-    let (dout_c, q_c, k_c, v_c, out_c) = (canon(dout_ptr), canon(q_ptr), canon(k_ptr), canon(v_ptr), canon(out_ptr));
+    let temps = [dout_ptr, q_ptr, k_ptr, v_ptr, out_ptr].map(|p| crate::attn_layout::to_layout(p, layout));
+    let [dout_c, q_c, k_c, v_c, out_c] = temps;
     let data = |p: i64| NslTensor::from_ptr(p).data as u64;
 
     let n_q = b * h * s * d;
@@ -1292,7 +1299,8 @@ fn tc_sdpa_backward(
     let dq = inner::alloc_managed(n_q * io.bytes());
     let dk = inner::alloc_managed(n_kv * io.bytes());
     let dv = inner::alloc_managed(n_kv * io.bytes());
-    let rc = crate::attention_tc::backward_io(&crate::attention_tc::BwdLaunch {
+    let bshd = layout == crate::attn_layout::HeadLayout::Bshd;
+    let rc = crate::attention_tc::backward_io_layout(&crate::attention_tc::BwdLaunch {
         q: data(q_c),
         k: data(k_c),
         v: data(v_c),
@@ -1311,7 +1319,7 @@ fn tc_sdpa_backward(
         head_dim: d,
         scale,
         causal,
-    }, io);
+    }, io, bshd);
     let sync_rc = if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS && inner::sync_mode_enabled() {
         unsafe { cudarc::driver::sys::cuCtxSynchronize() }
     } else {
@@ -1347,10 +1355,17 @@ fn tc_sdpa_backward(
         inner::free_managed(dv);
         return None;
     }
+    if bshd {
+        crate::attn_layout::count_route(crate::attn_layout::ROUTE_BWD);
+    }
+    // dQ/dK/dV in the operands' layout: `[b, s, h, d]` views go back through
+    // the adjoints of the head views as views, into the projections' GEMMs.
+    let (bi, hi, khi, si, di) = (b as i64, h as i64, kv_h as i64, s as i64, d as i64);
+    let wrap = |p: *mut c_void, heads: i64| crate::attn_layout::wrap_head_tensor(p, [bi, heads, si, di], layout, io_dtype, 1);
     let list = crate::list::nsl_list_new();
-    crate::list::nsl_list_push(list, make_gpu_tensor_dtype(dq, &[b as i64, h as i64, s as i64, d as i64], n_q, io_dtype));
-    crate::list::nsl_list_push(list, make_gpu_tensor_dtype(dk, &[b as i64, kv_h as i64, s as i64, d as i64], n_kv, io_dtype));
-    crate::list::nsl_list_push(list, make_gpu_tensor_dtype(dv, &[b as i64, kv_h as i64, s as i64, d as i64], n_kv, io_dtype));
+    crate::list::nsl_list_push(list, wrap(dq, hi));
+    crate::list::nsl_list_push(list, wrap(dk, khi));
+    crate::list::nsl_list_push(list, wrap(dv, khi));
     Some(list)
 }
 
@@ -1644,19 +1659,23 @@ pub extern "C" fn nsl_sdpa_fused_forward(
                 q_t.device, q_t.dtype, q_t.ndim, k_t.device, k_t.dtype, k_t.ndim,
                 v_t.device, v_t.dtype, v_t.ndim));
         }
-        // Stride guard: the v2 kernel reads raw device pointers
-        // stride-blind. A transpose/reshape VIEW here would compute
+        // Stride guard: the kernels read raw device pointers. Each operand
+        // must be stored in one of the two dense head layouts
+        // (`crate::attn_layout`): contiguous `[b, h, s, d]`, or the head
+        // view `x.reshape([b, s, h, d]).transpose(1, 2)` of a projection,
+        // which the tensor-core kernels read in place and which is copied
+        // contiguous for the kernels below. Any other view would compute
         // smoothly-wrong attention (no error) — decline instead; the
         // decomposed fallback is stride-correct.
-        if !is_canonical_row_major(q_t)
-            || !is_canonical_row_major(k_t)
-            || !is_canonical_row_major(v_t)
         {
-            decline!(format!(
-                "non-canonical strides: q={} k={} v={}",
-                is_canonical_row_major(q_t),
-                is_canonical_row_major(k_t),
-                is_canonical_row_major(v_t)));
+            use crate::attn_layout::head_layout;
+            if head_layout(q_t).is_none() || head_layout(k_t).is_none() || head_layout(v_t).is_none() {
+                decline!(format!(
+                    "strides in neither head layout: q={:?} k={:?} v={:?}",
+                    head_layout(q_t),
+                    head_layout(k_t),
+                    head_layout(v_t)));
+            }
         }
         let (b, h, s, d) = unsafe {
             (
@@ -1697,18 +1716,17 @@ pub extern "C" fn nsl_sdpa_fused_forward(
                     (k_ptr, v_ptr)
                 };
                 let launch_kv_h = if expand { h } else { kv_h };
+                // The layout the kernels read and write: Q's, when Q is the
+                // `[b, s, h, d]` head view and that layout is on; contiguous
+                // otherwise. K and V are copied into it when they differ.
+                let layout = crate::attn_layout::tc_layout(q_t, b, h, launch_kv_h, s, d);
+                let ops = [q_ptr, ke, ve].map(|t| crate::attn_layout::to_layout(t, layout));
                 let list = tc_sdpa_forward(
-                    q_t,
-                    NslTensor::from_ptr(ke),
-                    NslTensor::from_ptr(ve),
-                    b,
-                    h,
-                    launch_kv_h,
-                    s,
-                    d,
-                    scale_bits,
-                    causal != 0,
+                    ops, layout, b, h, launch_kv_h, s, d, scale_bits, causal != 0,
                 );
+                for t in ops {
+                    crate::tensor::nsl_tensor_free(t);
+                }
                 if expand {
                     crate::tensor::nsl_tensor_free(ke);
                     crate::tensor::nsl_tensor_free(ve);
@@ -1804,6 +1822,21 @@ pub extern "C" fn nsl_sdpa_fused_forward(
         } else {
             None
         };
+
+        // These kernels read contiguous operands: a `[b, s, h, d]` head view
+        // (`crate::attn_layout`, admitted by the stride guard) is copied
+        // first, as `nsl.nn.gqa` did in NSL source before the tensor-core
+        // kernels read that layout. The copies are freed with the expanded
+        // K/V.
+        let mut contiguous = |t: &'static mut NslTensor| -> &'static mut NslTensor {
+            if crate::attn_layout::is_in(t, crate::attn_layout::HeadLayout::Bhsd) {
+                return t;
+            }
+            let c = crate::attn_layout::to_layout(t as *const NslTensor as i64, crate::attn_layout::HeadLayout::Bhsd);
+            kv_expanded.push(c);
+            NslTensor::from_ptr(c)
+        };
+        let (q_t, k_t, v_t) = (contiguous(q_t), contiguous(k_t), contiguous(v_t));
 
         // Output + logsumexp buffers, zeroed (mirrors the backward's
         // alloc_managed discipline; ownership passes to the returned

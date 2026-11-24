@@ -409,17 +409,21 @@ fn cast_and_publish(src_ptr: i64, target_dtype: u16) -> i64 {
     let t = NslTensor::from_ptr_ref(src_ptr);
     // CFTP v6 Finding 2 (HIGH) + Finding 4 (MEDIUM): the contiguity and
     // len/shape invariants are correctness preconditions for BOTH the CPU
-    // host-staged path AND the v7 GPU PTX cast — keep them before any
-    // device-branch so a violating input is refused regardless of device.
-    // (Linear-read + row-major-strides assumption applies to GPU too: the
-    // cast kernels index `i in [0, numel)` over the source buffer without
-    // consulting strides.)
-    assert!(
-        t.is_contiguous(),
-        "cast_and_publish: source tensor must be contiguous (ndim={}); \
-         the wengert lowering must pass contiguous x/W/bias buffers.",
-        t.ndim
-    );
+    // host-staged path AND the v7 GPU PTX cast (the cast kernels index
+    // `i in [0, numel)` over the source buffer without consulting strides).
+    // A view is cast through a contiguous copy: `--checkpoint-compress`
+    // saves attention outputs and RoPE results, which are `[b, s, h, d]`
+    // head views (`crate::attn_layout`), and refusing them would stop a
+    // valid program. The copy records nothing on a tape (nor does the cast).
+    if !t.is_contiguous() {
+        let c = {
+            let _pause = crate::autodiff::TapePause::new();
+            crate::tensor::nsl_tensor_contiguous(src_ptr)
+        };
+        let out = cast_and_publish(c, target_dtype);
+        crate::tensor::nsl_tensor_free(c);
+        return out;
+    }
     assert_eq!(
         t.len,
         NslTensor::total_elements(t.shape, t.ndim),
@@ -2025,6 +2029,43 @@ mod to_dtype_tests {
         assert_eq!(got, vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0]);
         for t in [out, view, base] {
             nsl_tensor_free(t);
+        }
+    }
+}
+
+#[cfg(test)]
+mod view_cast_tests {
+    use super::*;
+
+    /// A view (the transposed head view `--checkpoint-compress` saves) is
+    /// cast through a contiguous copy: the result is the contiguous tensor's
+    /// cast, element for element, instead of a refusal.
+    #[test]
+    fn a_transposed_view_casts_like_its_contiguous_copy() {
+        let shape = crate::list::nsl_list_new();
+        for d in [2i64, 3, 4] {
+            crate::list::nsl_list_push(shape, d);
+        }
+        let x = crate::tensor::nsl_tensor_arange(0.0, 24.0, 1.0);
+        let x3 = crate::tensor::shape_ops::nsl_tensor_reshape(x, shape);
+        crate::list::nsl_list_free(shape);
+        let x32 = nsl_tensor_cast(x3, i64::from(DTYPE_F32));
+        let view = crate::tensor::nsl_tensor_transpose(x32, 0, 1);
+        assert!(!NslTensor::from_ptr_ref(view).is_contiguous());
+        let copy = crate::tensor::nsl_tensor_contiguous(view);
+        let (a, b) = (nsl_tensor_to_bf16(view), nsl_tensor_to_bf16(copy));
+        let (ta, tb) = (NslTensor::from_ptr_ref(a), NslTensor::from_ptr_ref(b));
+        assert_eq!((ta.dtype, ta.len), (DTYPE_BF16, 24));
+        let n = ta.len as usize;
+        let (sa, sb) = unsafe {
+            (
+                std::slice::from_raw_parts(ta.data as *const u16, n).to_vec(),
+                std::slice::from_raw_parts(tb.data as *const u16, n).to_vec(),
+            )
+        };
+        assert_eq!(sa, sb);
+        for t in [x, x3, x32, view, copy, a, b] {
+            crate::tensor::nsl_tensor_free(t);
         }
     }
 }

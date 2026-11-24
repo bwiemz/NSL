@@ -278,6 +278,8 @@ pub mod flash_attention;
 pub mod sdpa_gqa;
 #[cfg(feature = "cuda")]
 pub(crate) mod attention_tc;
+#[cfg(feature = "cuda")]
+pub(crate) mod attn_layout;
 pub mod pca_tier_b_runtime;
 pub mod pca_rope_runtime;
 pub mod serving;
