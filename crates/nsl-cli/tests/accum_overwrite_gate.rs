@@ -133,9 +133,10 @@ fn run(tag: &str, arm: Arm, env: &[(&str, &str)]) -> Out {
         .env_remove("NSL_ACCUM_OVERWRITE")
         .envs(env.iter().copied());
     if arm.bf16 {
-        // `--deterministic` sends the flash-attention backward to the host,
-        // which reads no bf16; keep it on the device's tensor-core kernels
-        // (deterministic: no atomics), as `lce_grad_in_forward_gate` does.
+        // Keep the flash-attention backward off the host reference, which
+        // reads no bf16, as `lce_grad_in_forward_gate` does. `--deterministic`
+        // takes the tensor-core kernels (no atomics) for this fixture anyway;
+        // the pin dates from when it sent every backward to the host.
         cmd.env("NSL_FLASH_BWD_CPU", "0");
     }
     let out = cmd.output().expect("spawn nsl run");
