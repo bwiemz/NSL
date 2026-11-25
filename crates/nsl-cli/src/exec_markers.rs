@@ -329,6 +329,12 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
         "the p9 fused FASE optimizer-step counter reported (NSL_FASE_FUSED_COUNTER=1)",
     ),
     m(
+        "[accum]",
+        &["crates/nsl-runtime/src/args.rs"],
+        "the fresh-accumulator counts at exit (NSL_ACCUM_COUNTER=1): buffers the \
+         optimizer step marked fresh, taken by a whole-buffer overwrite, and zeroed",
+    ),
+    m(
         "[bf16-cast-cache]",
         &[
             "crates/nsl-runtime/src/args.rs",
