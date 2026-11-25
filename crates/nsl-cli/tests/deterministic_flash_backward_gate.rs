@@ -316,10 +316,16 @@ fn deterministic_flag_makes_flash_backward_bit_reproducible() {
         .lines()
         .find(|l| l.contains("[flash-bwd] tensor-core backward dispatched"))
         .unwrap_or_else(|| {
-            panic!("the tensor-core backward was not dispatched without --deterministic:\n{}", plain.stderr)
+            panic!(
+                "the tensor-core backward was not dispatched without --deterministic:\n{}",
+                plain.stderr
+            )
         });
     for want in ["heads=8", "seq=512", "head_dim=64"] {
-        assert!(tc_dispatch.contains(want), "tensor-core backward at the wrong geometry: {want} not in `{tc_dispatch}`");
+        assert!(
+            tc_dispatch.contains(want),
+            "tensor-core backward at the wrong geometry: {want} not in `{tc_dispatch}`"
+        );
     }
     assert_eq!(
         plain.runs[0], plain.runs[1],
@@ -438,11 +444,12 @@ fn plain_arm(tag: &str, envs: &[(&str, &str)]) -> PlainArm {
 /// The `NSL_FLASH_BWD_CPU` escape hatch is TRI-STATE, and each state is pinned
 /// here because the middle one (unset) is the only one the main test covers.
 ///
-/// The routing is correct by default but costs ~36x per step at Coder-50M, and
-/// several existing GPU gates pass `--deterministic` for reasons unrelated to
-/// attention. `=0` buys their speed back at the price of the guarantee, so it
-/// has to be LOUD — a silent opt-out would reintroduce exactly the situation
-/// this campaign fixed: a run that believes it is reproducible and is not.
+/// `=0` opts out of the host fallback. The tensor-core kernels stay
+/// bit-reproducible, so a run they serve end to end keeps the guarantee and
+/// must say nothing; a run that reaches the phase-2 kernels (here forced with
+/// `NSL_TC_ATTENTION=0`) loses it, so it has to be LOUD — a silent opt-out
+/// would reintroduce exactly the situation this campaign fixed: a run that
+/// believes it is reproducible and is not.
 ///
 /// Note what is asserted and what is not. The warning and the route count are
 /// deterministic facts about the routing decision. Whether the opted-out run
@@ -452,8 +459,13 @@ fn plain_arm(tag: &str, envs: &[(&str, &str)]) -> PlainArm {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn flash_bwd_cpu_env_overrides_deterministic_loudly() {
-    // `=0` under --deterministic: opt out, and say so.
-    let out = run_fixture_env("optout", true, &[("NSL_FLASH_BWD_CPU", "0")]);
+    const WARNING: &str = "NSL_FLASH_BWD_CPU=0 overrides --deterministic";
+    // `=0` under --deterministic with the phase-2 kernels: opt out, and say so.
+    let out = run_fixture_env(
+        "optout",
+        true,
+        &[("NSL_FLASH_BWD_CPU", "0"), ("NSL_TC_ATTENTION", "0")],
+    );
     assert!(
         out.success,
         "opt-out run failed:\nstdout:\n{}\nstderr:\n{}",
@@ -468,10 +480,34 @@ fn flash_bwd_cpu_env_overrides_deterministic_loudly() {
         out.stderr
     );
     assert!(
-        out.stderr.contains("NSL_FLASH_BWD_CPU=0 overrides --deterministic"),
+        out.stderr.contains(WARNING),
         "opting out of --deterministic's bit-reproducibility printed no \
          warning. A run that quietly loses the guarantee it was asked for is \
          the bug this gate exists to prevent:\n{}",
+        out.stderr
+    );
+
+    // `=0` under --deterministic with the tensor-core kernels: every backward
+    // stays single-writer, so the run keeps the guarantee and must not claim
+    // to have lost it.
+    let out = run_fixture_env("optout_tc", true, &[("NSL_FLASH_BWD_CPU", "0")]);
+    assert!(
+        out.success,
+        "tensor-core opt-out run failed:\nstdout:\n{}\nstderr:\n{}",
+        out.stdout, out.stderr
+    );
+    assert_eq!(det_route_count(&out.stdout), 0, "{}", out.stderr);
+    assert!(
+        out.stderr
+            .contains("[flash-bwd] tensor-core backward dispatched"),
+        "the tensor-core opt-out arm never dispatched the tensor-core backward, \
+         so its silence proves nothing:\n{}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains(WARNING),
+        "the tensor-core backward served this opted-out run, which stays \
+         bit-reproducible, yet it warned that the guarantee was lost:\n{}",
         out.stderr
     );
 

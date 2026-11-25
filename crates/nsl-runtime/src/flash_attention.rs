@@ -8006,25 +8006,16 @@ pub extern "C" fn nsl_flash_attention_backward(
         // for reasons unrelated to the attention backward used to pay it.
         //   unset  -> `--deterministic` decides (tensor-core kernels, else host)
         //   "1"    -> force the CPU reference everywhere, even without the flag
-        //   "0"    -> OPT OUT of the deterministic routing, loudly
-        // The opt-out is deliberately noisy on stderr rather than silent: it
-        // gives back exactly the guarantee the flag advertises, so a run that
-        // takes it should say so in its own log.
+        //   "0"    -> OPT OUT of the host fallback, loudly where it costs
+        // Opting out keeps the tensor-core kernels, which stay bit-reproducible,
+        // and sends the phase-2 shapes to the phase-2 kernels, which are not. So
+        // the warning is printed where a deterministic run first takes a phase-2
+        // kernel (the GPU branch below), not for every opted-out run: a run the
+        // tensor-core kernels serve end to end keeps the guarantee and should not
+        // say it lost it.
         let deterministic_mode = crate::deterministic_ops::is_deterministic();
         let bwd_cpu_env = std::env::var("NSL_FLASH_BWD_CPU").ok();
         let opted_out = bwd_cpu_env.as_deref() == Some("0");
-        if opted_out && deterministic_mode && dout_t.device > 0 {
-            static WARNED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                crate::nsl_log!(WARN, "flash-bwd", 
-                    "[flash-bwd] WARNING: NSL_FLASH_BWD_CPU=0 overrides --deterministic. \
-                     The phase-2 backward (packed batches, head dims other than 64 and 128, \
-                     NSL_TC_ATTENTION=0) accumulates dQ with a cross-CTA atomicAdd, so this \
-                     run is NOT guaranteed bit-reproducible run-to-run."
-                );
-            }
-        }
         let force_cpu_bwd = !opted_out
             && (deterministic_mode || bwd_cpu_env.as_deref() == Some("1"));
         // `--deterministic` alone does not need the host: the tensor-core
@@ -8137,6 +8128,19 @@ pub extern "C" fn nsl_flash_attention_backward(
             && (kv_h == h || gqa_expandable)
             && !force_cpu_bwd
         {
+            if deterministic_mode && opted_out {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    crate::nsl_log!(WARN, "flash-bwd",
+                        "[flash-bwd] WARNING: NSL_FLASH_BWD_CPU=0 overrides --deterministic. \
+                         This backward takes the phase-2 kernels (packed batches, head dims \
+                         other than 64 and 128, NSL_TC_ATTENTION=0), which accumulate dQ with \
+                         a cross-CTA atomicAdd, so this run is NOT guaranteed bit-reproducible \
+                         run-to-run."
+                    );
+                }
+            }
             // Budget-aware backward tile sizes. Must match the sizes codegen used to
             // synthesize the Phase-2 PTX; both sides derive them from head_dim via
             // the same `select_backward_blocks` table (codegen's copy lives in
@@ -8431,9 +8435,11 @@ pub extern "C" fn nsl_flash_attention_backward(
     // expansion's own adjoint, `crate::sdpa_gqa::group_sum_expanded_grad`).
     // That is the computation of a call whose K/V `nsl.nn.gqa` expanded in
     // NSL source, so this reference gives the same bits whether a program
-    // passes grouped or expanded K/V — the `--deterministic` route of every
-    // GPU attention backward included. (Accumulating dK/dV of a whole group
-    // in one buffer would round in a different order.)
+    // passes grouped or expanded K/V. (Accumulating dK/dV of a whole group in
+    // one buffer would round in a different order.) The tensor-core backward,
+    // which `--deterministic` takes wherever it applies, sums a group inside
+    // its dK/dV kernel instead: bit-reproducible run to run, but not the same
+    // bits for grouped and expanded K/V.
     let expand_groups = (gqa_groups > 1 && kv_h * gqa_groups == h).then_some(gqa_groups);
     let (k_data, v_data, call_kv_h, call_groups) = match expand_groups {
         Some(g) => {
@@ -8548,8 +8554,10 @@ pub extern "C" fn nsl_flash_attention_backward(
     //
     // This leak predates the M46 routing change, but that change is what makes
     // it matter: this path used to be reached only by tape AD, irregular GQA,
-    // or a GPU refusal, and `--deterministic` now sends EVERY GPU attention
-    // backward through it. At coder50m (b=1, h=8, kv_h=4, s=1024, d=64) the
+    // or a GPU refusal, and the M46 change sent EVERY `--deterministic` GPU
+    // attention backward through it. (Since 2026-11-24 `--deterministic` takes
+    // the tensor-core backward where it applies; the phase-2 shapes and
+    // `NSL_FLASH_BWD_CPU=1` still come here.) At coder50m (b=1, h=8, kv_h=4, s=1024, d=64) the
     // three tensors are ~4 MiB per call, x8 blocks = ~32 MiB per micro-step —
     // a 26,148-step run would orphan hundreds of GiB of host RAM and be
     // OOM-killed long before it finished.
