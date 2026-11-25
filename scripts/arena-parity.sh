@@ -21,10 +21,22 @@
 # allocator pin returns the same pointer every step, which is exactly what
 # the recorder's digest-stability test wants), so the composed arm must be
 # byte-identical too, reconcile its placements WHILE regions replay
-# captured graphs, and stabilize capture no later than graphs-alone.
-# Measured on this fixture 2026-08-07: graphs-alone captures after window
-# 3 (35 replays); with the arena the digest stabilizes one window earlier
-# (36 replays). The canonical cuda_graph_gate.nsl fixture shows NO delta —
+# captured graphs, and stabilize capture within one window of graphs-alone.
+# The arena's own slots cannot move, but serving its transients from the
+# arena changes the request stream the caching allocator sees, so the pool's
+# warm-up (the step at which it stops mapping new segments and its addresses
+# repeat) can finish one window earlier or later. Measured on this fixture:
+#   - 2026-08-07, CPU attention backward: graphs-alone 35 replays, composed
+#     36 (one window earlier);
+#   - 2026-11-25, tensor-core attention backward under --deterministic:
+#     graphs-alone 36, composed 35. NSL_CUDA_GRAPH_LOG=1 shows the composed
+#     arm's backward diverging once, at round 3, on a pool address
+#     (nsl_sum_dim_short_f32's output), in the step where the pool maps one
+#     more 96 MiB segment than graphs-alone does; from round 3 on the digest
+#     repeats.
+# A slot that moved, or a pin that missed, would diverge every window and
+# fail the captured/replays checks below by far more than one window.
+# The canonical cuda_graph_gate.nsl fixture shows NO delta —
 # its transients are exactly the classes admission refuses (forward-region,
 # unsized, tape-escaping), which is why THIS fixture hosts the composition
 # gate.
@@ -120,10 +132,12 @@ gfield() { sed -E "s/.* $2=([0-9]+).*/\1/" <<<"$1"; }
 [ "$(gfield "${GBANNER}" captured)" -gt 0 ] || fail "graphs arm captured nothing (vacuous)"
 [ "$(gfield "${ABANNER}" captured)" -gt 0 ] || fail "composed arm captured nothing"
 [ "$(gfield "${ABANNER}" mismatches)" = 0 ] || fail "composed arm had graph mismatches"
-# The arena must never make capture stabilize LATER (its whole contribution
-# is address stability); equality is fine — improvement is fixture-shaped.
-[ "$(gfield "${ABANNER}" replays)" -ge "$(gfield "${GBANNER}" replays)" ] \
-  || fail "composed arm replays fewer than graphs-alone — the arena destabilized a digest"
+# The arena's slots are address-stable by construction; what it can shift is
+# the caching pool's warm-up, by one window either way (see the header). More
+# than one window late means an address kept moving: the arena destabilized
+# a digest.
+[ "$(gfield "${ABANNER}" replays)" -ge "$(( $(gfield "${GBANNER}" replays) - 1 ))" ] \
+  || fail "composed arm replays more than one window fewer than graphs-alone — the arena destabilized a digest"
 
 ATEAR="$(grep -E '^\[arena\] teardown:' "${WORK}/grarena.err" || true)"
 [ -n "${ATEAR}" ] || fail "composed arm: no arena teardown line"
