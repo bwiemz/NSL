@@ -64,9 +64,11 @@ static SCRATCH_DIRS: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mute
 /// objects (and, for `nsl run`, a 100-270 MB unstripped executable). Test suites
 /// exercise those paths by the thousand: on 2026-11-23 4,798 `nsl_build_<pid>`
 /// directories (5.4 GB) sat in a 31 GB `/tmp` tmpfs that test leftovers had
-/// filled, and every link on the machine failed. `process::exit` runs the C
-/// `atexit` handlers, so registering the directory once covers every exit.
-/// A process killed by a signal still leaves it.
+/// filled, and every link on the machine failed. On Unix `process::exit` runs
+/// the C `atexit` handlers, so registering the directory once covers every exit.
+/// On Windows it is `ExitProcess`, which skips them; there the loader's
+/// process-detach TLS callback (`SCRATCH_PROCESS_DETACH`) removes the
+/// directories instead. A process killed by a signal still leaves them.
 pub(crate) fn create_scratch_dir(name: &str) -> std::io::Result<std::path::PathBuf> {
     let dir = std::env::temp_dir().join(name);
     std::fs::create_dir_all(&dir)?;
@@ -80,6 +82,13 @@ pub(crate) fn create_scratch_dir(name: &str) -> std::io::Result<std::path::PathB
         // `remove_scratch_dirs_at_exit` never unwinds.
         unsafe {
             atexit(remove_scratch_dirs_at_exit);
+        }
+        // A reference keeps the linker from discarding the callback's section,
+        // as std does for its own TLS callback.
+        // SAFETY: a read of an initialized static of a `Copy` type.
+        #[cfg(windows)]
+        unsafe {
+            std::ptr::from_ref(&SCRATCH_PROCESS_DETACH).read_volatile();
         }
     });
     if let Ok(mut dirs) = SCRATCH_DIRS.lock()
@@ -102,13 +111,46 @@ extern "C" fn remove_scratch_dirs_at_exit() {
     // An unwind out of an `extern "C"` fn aborts; a failure to clean up must not.
     let _ = std::panic::catch_unwind(|| {
         // `try_lock`: a thread holding the lock while the process exits must not hang the exit.
-        let Ok(dirs) = SCRATCH_DIRS.try_lock() else {
+        let Ok(mut dirs) = SCRATCH_DIRS.try_lock() else {
             return;
         };
-        for dir in dirs.iter() {
-            remove_unless_kept(dir);
+        // Drained: on Windows a CRT exit runs this hook and then the
+        // process-detach callback, which must find nothing left to do.
+        for dir in std::mem::take(&mut *dirs) {
+            remove_unless_kept(&dir);
         }
     });
+}
+
+/// The Windows exit hook. `std::process::exit` there is `ExitProcess`, which
+/// never runs the C `atexit` handlers, so every failure path left its scratch
+/// directory behind (`scratch_cleanup_gate`). `ExitProcess` does still call
+/// each loaded image's TLS callbacks with `DLL_PROCESS_DETACH`, the
+/// executable's included.
+#[cfg(windows)]
+#[used]
+#[unsafe(link_section = ".CRT$XLB")]
+static SCRATCH_PROCESS_DETACH: unsafe extern "system" fn(
+    *mut std::ffi::c_void,
+    u32,
+    *mut std::ffi::c_void,
+) = scratch_process_detach;
+
+#[cfg(windows)]
+unsafe extern "system" fn scratch_process_detach(
+    _module: *mut std::ffi::c_void,
+    reason: u32,
+    _reserved: *mut std::ffi::c_void,
+) {
+    const DLL_PROCESS_DETACH: u32 = 0;
+    // The other threads are gone by now, and one may have died holding
+    // stderr's lock, so this path must not log: with `NSL_KEEP_TEMP=1` it
+    // leaves the directories without the "retaining" line.
+    if reason == DLL_PROCESS_DETACH
+        && std::env::var_os("NSL_KEEP_TEMP").is_none_or(|v| v != "1")
+    {
+        remove_scratch_dirs_at_exit();
+    }
 }
 
 pub(crate) use normal::{run_build, run_build_inner};
