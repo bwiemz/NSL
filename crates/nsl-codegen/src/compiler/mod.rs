@@ -822,6 +822,11 @@ pub struct Compiler<'a> {
     /// the forward needs to write it: installed by the train driver before
     /// the step's forward lowering and cleared after its adjoint lowering.
     pub(crate) lce_gif: Option<crate::wengert_lower::LceGifLowering>,
+    /// The train block being lowered leaves its gradient accumulators to the
+    /// next window's first writes instead of zeroing them in the AdamW step
+    /// (`nsl_runtime::accum_fresh`): set by the optimizer-step emission,
+    /// read by the trailing-window flush and the teardown, cleared there.
+    pub(crate) accum_keep_mp: bool,
     /// The x gradient such a head's forward computed, keyed by the
     /// `FusedLinearCe` result Value; taken by its backward extract.
     pub(crate) lce_gif_dx: HashMap<Value, Value>,
@@ -1009,6 +1014,9 @@ pub struct Compiler<'a> {
     pub(crate) add_norm_groups: Option<HashMap<crate::wengert::VarId, crate::wengert::WengertOp>>,
     /// Grouped launches emitted for the train block being lowered: (all, forward).
     pub(crate) add_norm_fused: (usize, usize),
+    /// Round 3: one-pass RMSNorm backward launches (`wengert_lower::norm_backward_groups`)
+    /// emitted for the train block being lowered.
+    pub(crate) norm_bwd_fused: usize,
     /// The program's parameter storage (`param_dtype=` on a top-level train
     /// block, resolved before `main` for the fingerprint and the banner);
     /// `None` for f32 parameters.
@@ -1328,6 +1336,7 @@ impl<'a> Compiler<'a> {
             fase_inplace: None,
             tied_embed_plan: None,
             lce_gif: None,
+            accum_keep_mp: false,
             lce_gif_dx: HashMap::new(),
             csha_fused_bwd_cache: HashMap::new(),
             fused_ce_fwd_lse: HashMap::new(),
@@ -1354,6 +1363,7 @@ impl<'a> Compiler<'a> {
             add_norm_stash: HashMap::new(),
             add_norm_groups: None,
             add_norm_fused: (0, 0),
+            norm_bwd_fused: 0,
             param_storage: None,
             activation_bf16: false,
             packing_meta_vars: None,

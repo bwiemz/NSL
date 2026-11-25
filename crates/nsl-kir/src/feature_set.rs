@@ -21,6 +21,10 @@ impl FeatureSet {
     /// Asynchronous global → shared copies with commit/wait groups
     /// (`cp.async` on sm_80+). Roadmap A2 step 2.
     pub const ASYNC_COPY: Self = FeatureSet(0x80);
+    /// Conversion of f32 to the 8-bit float E4M3
+    /// (`cvt.rn.satfinite.e4m3x2.f32`): sm_89+ with PTX ISA 8.1. The MXFP8
+    /// quantizers use it.
+    pub const FP8_CONVERT: Self = FeatureSet(0x100);
 
     pub fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0
@@ -58,6 +62,12 @@ impl FeatureSet {
         }
         if self.0 & 0x40 != 0 {
             names.push("bf16_arithmetic");
+        }
+        if self.0 & 0x80 != 0 {
+            names.push("async_copy");
+        }
+        if self.0 & 0x100 != 0 {
+            names.push("fp8_convert");
         }
         names
     }

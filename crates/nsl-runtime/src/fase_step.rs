@@ -428,9 +428,72 @@ pub extern "C" fn nsl_fase_fused_adamw_step_multi(
     mp_scale: f64,
 ) {
     fase_multi_impl(
-        params_list, m_list, v_list, mp_list, None, lr, beta1, one_minus_beta1,
-        beta2, one_minus_beta2, eps, wd, bc1_inv, bc2_inv, wd_exempt_list,
-        wd_exempt_non_rank2, mp_scale,
+        params_list,
+        m_list,
+        v_list,
+        mp_list,
+        None,
+        lr,
+        beta1,
+        one_minus_beta1,
+        beta2,
+        one_minus_beta2,
+        eps,
+        wd,
+        bc1_inv,
+        bc2_inv,
+        wd_exempt_list,
+        wd_exempt_non_rank2,
+        mp_scale,
+        true,
+    );
+}
+
+/// [`nsl_fase_fused_adamw_step_multi`] leaving every accumulator in place:
+/// the `_keepmp` kernels, and no zero on the unbatched arm. The caller marks
+/// the list fresh (`crate::accum_fresh::nsl_accum_mark_fresh`) right after,
+/// so the next window's first writes overwrite the buffers instead of adding
+/// onto zeros this step would have stored. Emitted only where the compiler
+/// admits the protocol (`stmt_train::optimizer_step`).
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nsl_fase_fused_adamw_step_multi_keep_mp(
+    params_list: i64,
+    m_list: i64,
+    v_list: i64,
+    mp_list: i64,
+    lr: f64,
+    beta1: f64,
+    one_minus_beta1: f64,
+    beta2: f64,
+    one_minus_beta2: f64,
+    eps: f64,
+    wd: f64,
+    bc1_inv: f64,
+    bc2_inv: f64,
+    wd_exempt_list: i64,
+    wd_exempt_non_rank2: i64,
+    mp_scale: f64,
+) {
+    fase_multi_impl(
+        params_list,
+        m_list,
+        v_list,
+        mp_list,
+        None,
+        lr,
+        beta1,
+        one_minus_beta1,
+        beta2,
+        one_minus_beta2,
+        eps,
+        wd,
+        bc1_inv,
+        bc2_inv,
+        wd_exempt_list,
+        wd_exempt_non_rank2,
+        mp_scale,
+        false,
     );
 }
 
@@ -470,9 +533,24 @@ pub extern "C" fn nsl_fase_fused_adamw_step_multi_idx(
         .map(|k| unsafe { *idxs_l.data.add(k) })
         .collect();
     fase_multi_impl(
-        params_list, m_list, v_list, mp_list, Some(&idxs), lr, beta1,
-        one_minus_beta1, beta2, one_minus_beta2, eps, wd, bc1_inv, bc2_inv,
-        wd_exempt_list, wd_exempt_non_rank2, mp_scale,
+        params_list,
+        m_list,
+        v_list,
+        mp_list,
+        Some(&idxs),
+        lr,
+        beta1,
+        one_minus_beta1,
+        beta2,
+        one_minus_beta2,
+        eps,
+        wd,
+        bc1_inv,
+        bc2_inv,
+        wd_exempt_list,
+        wd_exempt_non_rank2,
+        mp_scale,
+        true,
     );
 }
 
@@ -499,6 +577,8 @@ fn fase_multi_impl(
     wd_exempt_list: i64,
     wd_exempt_non_rank2: i64,
     mp_scale: f64,
+    // `false`: leave every accumulator in place for `accum_fresh` to mark.
+    zero_mp: bool,
 ) {
     let params = crate::list::NslList::from_ptr(params_list);
     let ms = crate::list::NslList::from_ptr(m_list);
@@ -674,7 +754,9 @@ fn fase_multi_impl(
                 param_wd(i, tp), bc1_inv, bc2_inv,
             );
         }
-        crate::tensor::nsl_tensor_zero_inplace(ap);
+        if zero_mp {
+            crate::tensor::nsl_tensor_zero_inplace(ap);
+        }
         FASE_MULTI_FALLBACK_PARAMS.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -729,6 +811,7 @@ fn fase_multi_impl(
                     },
                     mp_scale as f32,
                     0,
+                    !zero_mp,
                 );
                 crate::param_storage::note_stepped(k as u64);
             } else {
@@ -753,6 +836,7 @@ fn fase_multi_impl(
                     bucket_wd != 0.0,
                     mp_scale as f32,
                     key.m_dtype == BF16,
+                    !zero_mp,
                 );
             }
             // Keep the fused-step counter's per-param semantics (gates read it).
@@ -1053,6 +1137,67 @@ mod tests {
         }
     }
 
+    /// The keep variant on the unbatched arm (host tensors): θ, m and v are the
+    /// zeroing step's bits, and the accumulator is left as it was instead of
+    /// zeroed.
+    #[test]
+    fn the_keep_step_leaves_the_accumulator_on_the_unbatched_arm() {
+        use crate::list::{nsl_list_free, nsl_list_new, nsl_list_push};
+        let n = 9;
+        let (th, m, v, mp) = inputs_f64(n);
+        let (lr, b1, omb1, b2, omb2, eps, wd, bc1, bc2) = SCALARS;
+        let bits = |p: i64| -> Vec<u64> {
+            let t = NslTensor::from_ptr(p);
+            (0..n)
+                .map(|i| unsafe { (*t.data_f64().add(i)).to_bits() })
+                .collect()
+        };
+        let mut runs = Vec::new();
+        for keep in [false, true] {
+            let ts = [make_f64(&th), make_f64(&m), make_f64(&v), make_f64(&mp)];
+            let lists: Vec<i64> = ts
+                .iter()
+                .map(|&t| {
+                    let l = nsl_list_new();
+                    nsl_list_push(l, t);
+                    l
+                })
+                .collect();
+            let step = if keep {
+                nsl_fase_fused_adamw_step_multi_keep_mp
+            } else {
+                nsl_fase_fused_adamw_step_multi
+            };
+            step(
+                lists[0], lists[1], lists[2], lists[3], lr, b1, omb1, b2, omb2, eps, wd, bc1, bc2,
+                0, 0, 1.0,
+            );
+            runs.push(ts.map(bits));
+            for l in lists {
+                nsl_list_free(l);
+            }
+            for t in ts {
+                nsl_tensor_free(t);
+            }
+        }
+        let (zero, keep) = (&runs[0], &runs[1]);
+        assert_eq!(
+            keep[..3],
+            zero[..3],
+            "theta, m, v differ from the zeroing step's"
+        );
+        assert_eq!(
+            zero[3],
+            vec![0u64; n],
+            "the zeroing step zeroes the accumulator"
+        );
+        assert_eq!(
+            keep[3],
+            mp.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "the keep step wrote the accumulator"
+        );
+    }
+
     /// Out-of-range indices must die loudly, not read past the lists. Tested
     /// through the internal impl (a plain Rust fn) — a panic crossing the
     /// `extern "C"` wrapper would abort the process instead of unwinding.
@@ -1069,8 +1214,24 @@ mod tests {
         nsl_list_push(vl, make_f64(&v));
         nsl_list_push(al, make_f64(&mp));
         fase_multi_impl(
-            pl, ml, vl, al, Some(&[1]), lr, b1, omb1, b2, omb2, eps, wd, bc1,
-            bc2, 0, 0, 1.0,
+            pl,
+            ml,
+            vl,
+            al,
+            Some(&[1]),
+            lr,
+            b1,
+            omb1,
+            b2,
+            omb2,
+            eps,
+            wd,
+            bc1,
+            bc2,
+            0,
+            0,
+            1.0,
+            true,
         );
     }
 }
@@ -1640,8 +1801,8 @@ mod item8_gpu_bench {
         let (eps, neg_lr, neg_lr_wd, bc1, bc2) =
             (1e-8f32, -1e-3f32, -1e-5f32, 1.0f32, 1.0f32);
         gpu_fase_fused_adamw_step_multi(
-            &thetas, &ms, &vs, &mps, &lens, b1, omb1, b2, omb2, eps, neg_lr,
-            neg_lr_wd, bc1, bc2, true, 1.0, false,
+            &thetas, &ms, &vs, &mps, &lens, b1, omb1, b2, omb2, eps, neg_lr, neg_lr_wd, bc1, bc2,
+            true, 1.0, false, false,
         );
 
         // Same arithmetic as the kernel, in f32, on the host.
@@ -1715,8 +1876,8 @@ mod item8_gpu_bench {
 
         let step = || {
             gpu_fase_fused_adamw_step_multi(
-                &thetas, &ms, &vs, &mps, &lens, 0.9, 0.1, 0.95, 0.05, 1e-8, -1e-3, -1e-5,
-                1.0, 1.0, true, 1.0, false,
+                &thetas, &ms, &vs, &mps, &lens, 0.9, 0.1, 0.95, 0.05, 1e-8, -1e-3, -1e-5, 1.0, 1.0,
+                true, 1.0, false, false,
             );
         };
 

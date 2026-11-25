@@ -92,6 +92,9 @@ mod abi_check;
 pub mod tensor;
 pub(crate) mod cpu;
 pub(crate) mod cuda;
+/// MXFP8 GEMM building blocks (E4M3 + per-32 UE8M0 scales through cublasLt).
+#[cfg(feature = "cuda")]
+pub mod mxfp8;
 
 // Doc-hidden re-exports for cross-crate integration tests
 // (see crates/nsl-codegen/tests/csha_cuda_launch_*). Keeping the cuda
@@ -168,6 +171,10 @@ pub use cuda::{test_bf16_cast_cache_reset, test_bf16_cast_cache_stats};
 pub use cuda::{test_lce_logits_probe, test_lt_matmul_reset, test_lt_matmul_stats, test_lt_matmul_tf32_stats, test_storage_copy_regional_count};
 #[cfg(all(feature = "cuda", feature = "test-hooks"))]
 pub use cuda::{test_kernel_launch_census_arm, test_kernel_launch_count};
+// Test-only re-export: the fused RMSNorm backward and the three-kernel gamma
+// gradient at a caller-chosen chunking (bit-identity gates, timing).
+#[cfg(all(feature = "cuda", feature = "test-hooks"))]
+pub use cuda::{test_rmsnorm_backward_fused_chunked, test_rmsnorm_dgamma_chunked};
 
 // Compile-time GPU-database lookup key for nsl-codegen (None on GPU-less
 // machines / non-cuda builds — non-panicking by design).
@@ -190,6 +197,7 @@ pub mod fp8;
 pub mod awq;
 pub mod fase_bc;
 pub mod fase_step;
+pub mod accum_fresh;
 pub mod optim_groups;
 pub mod muon;
 pub mod muon_batch;

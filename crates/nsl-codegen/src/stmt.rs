@@ -2003,8 +2003,17 @@ impl Compiler<'_> {
         bc: (Value, Value),
         groups: (Value, Value),
         mp_scale: Value,
+        // Leave the accumulators in place and mark them fresh
+        // (`nsl_runtime::accum_fresh`, admitted by `accum_keep_mp_admitted`).
+        keep_mp: bool,
     ) -> Result<(), CodegenError> {
         let (param_list, state_list_1, state_list_2, accum) = lists;
+        if keep_mp && owner_gated_moments {
+            return Err(CodegenError::new(
+                "internal: the fresh-accumulator step was admitted under ZeRO, whose owner-subset \
+                 launch and non-owner zeroing it does not cover",
+            ));
+        }
         let lr_v = lr_runtime;
         let b1_v = builder.ins().f64const(sc.beta1);
         let omb1_v = builder.ins().f64const(sc.one_minus_beta1);
@@ -2051,7 +2060,11 @@ impl Compiler<'_> {
         } else {
             self.compile_call_by_name(
                 builder,
-                "nsl_fase_fused_adamw_step_multi",
+                if keep_mp {
+                    "nsl_fase_fused_adamw_step_multi_keep_mp"
+                } else {
+                    "nsl_fase_fused_adamw_step_multi"
+                },
                 &[
                     param_list,
                     state_list_1,
@@ -2071,6 +2084,9 @@ impl Compiler<'_> {
                     mp_scale,
                 ],
             )?;
+            if keep_mp {
+                self.compile_call_by_name(builder, "nsl_accum_mark_fresh", &[accum])?;
+            }
         }
         Ok(())
     }

@@ -24,6 +24,33 @@ macro_rules! var {
 
 pub static REGISTRY: &[EnvVar] = &[
     var!(
+        "NSL_ACCUM_COUNTER",
+        Bool,
+        "1 only",
+        "off",
+        Diagnostic,
+        Runtime,
+        "Set to 1 to print at exit how many gradient accumulators were marked fresh, overwritten by a first write, and zeroed."
+    ),
+    var!(
+        "NSL_ACCUM_OVERWRITE",
+        Bool,
+        "0 disables; anything else or unset = on",
+        "on",
+        Perf,
+        Compile,
+        "Kill switch for leaving the gradient accumulators to the next window's first writes instead of zeroing them in the AdamW step."
+    ),
+    var!(
+        "NSL_ACCUM_TEST_POISON",
+        Bool,
+        "1 only",
+        "off",
+        Test,
+        Runtime,
+        "Gates only: fills each gradient accumulator with NaN when the AdamW step marks it fresh, so a stale read shows."
+    ),
+    var!(
         "NSL_ALIGN_DEBUG",
         Bool,
         "any value (presence via is_ok; both sites)",
@@ -688,6 +715,15 @@ pub static REGISTRY: &[EnvVar] = &[
         Perf,
         Compile,
         "Kill switch for fusing single-reader elementwise chains of the backward tape into one kernel (bit-exact by construction)."
+    ),
+    var!(
+        "NSL_FUSE_NORM_DGAMMA",
+        Bool,
+        "0 disables; anything else or unset = on",
+        "on",
+        Perf,
+        Compile,
+        "Kill switch for computing the RMSNorm input and gain gradients in one pass over the row (needs --fuse-rmsnorm-backward)."
     ),
     var!(
         "NSL_FUSE_NORM_RESIDUAL",

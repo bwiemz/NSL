@@ -56,6 +56,9 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi_param(
     s: AdamwScalars,
     mp_scale: f32,
     sr_key: u64,
+    // Leave every `mp` in place (the `_keepmp` kernel): the caller marks the
+    // buffers fresh (`crate::accum_fresh`) instead of having them zeroed.
+    keep_mp: bool,
 ) {
     let k = bucket.theta.len();
     if k == 0 {
@@ -228,8 +231,15 @@ pub(crate) fn gpu_fase_fused_adamw_step_multi_param(
     }
     args.extend([a(&mut bp), a(&mut bb), f(&mut scale)]);
 
-    let ptx = kernels::fase_param_multi_ptx(theta, m_bf16);
-    let name = format!("{}\0", nsl_kir::kernels::optim::multi_name(theta, m_bf16));
+    let (ptx, name) = if keep_mp {
+        let (ptx, name) = kernels::fase_multi_keep_mp_ptx(theta, m_bf16);
+        (ptx.as_str(), name.clone())
+    } else {
+        (
+            kernels::fase_param_multi_ptx(theta, m_bf16),
+            format!("{}\0", nsl_kir::kernels::optim::multi_name(theta, m_bf16)),
+        )
+    };
     let result = inner::kernel_launch(
         ptx.as_ptr(),
         name.as_ptr(),
