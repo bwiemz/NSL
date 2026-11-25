@@ -3704,6 +3704,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+<!-- det-tc (2026-11-25): --deterministic takes the tensor-core attention backward. -->
+- **`--deterministic` takes the tensor-core attention backward wherever it applies.**
+  - Before: every flash-attention backward under `--deterministic` went to the CPU reference, because the phase-2 kernels add dQ with cross-CTA atomics. That cost about 36x per step at Coder-50M. It also made `--deterministic` with `precision="bf16"` fail unless `NSL_FLASH_BWD_CPU=0` was set, because the reference reads no bf16.
+  - The tensor-core kernels (unpacked, head_dim 64 or 128) give every dQ, dK and dV element one writer and use no atomics, so they are bit-reproducible run to run.
+  - Only the phase-2 shapes still go to the host: packed batches, other head dims, and `NSL_TC_ATTENTION=0`. `NSL_FLASH_BWD_CPU=1` forces the host everywhere.
+  - Grouped and expanded K/V give the same bits only on the host reference. The tensor-core kernel sums a group inside its dK/dV kernel, in a different order.
+  - `NSL_FLASH_BWD_CPU=0` under `--deterministic` now warns only when a backward reaches the phase-2 kernels, which is where the guarantee is lost. A run the tensor-core kernels serve end to end stays silent.
+  - `scripts/arena-parity.sh` allows the composed `--cuda-graphs --transient-arena` arm to capture one window after graphs alone, where it used to require capture no later. With the backward capturable again, the caching pool's warm-up ends one step later in the composed arm. The arena's own slots never move. On main the script cannot pass under `--deterministic`: the host backward taints the region, and the graphs arm captures nothing.
+  - Verified:
+    - every `--deterministic` attention gate (69) plus cert parts 00-06 (42 gates) pass on the branch;
+    - after merging main, the 26 gates of the touched and newly routed files pass, including `norm_bwd_fusion_gate`, which now runs on the tensor-core backward.
 - **Coder-500M runs the 1B recipe's flag line, at twice the speed.**
   - `models/coder500m/pretrain_prod.nsl` and its README now run `--source-ad --checkpoint-blocks --checkpoint-selective --fuse-rmsnorm-backward --fuse-wgrad-accum`; the line was `--source-ad --checkpoint-blocks`. Measured on the recipe's pinned 0.11 toolchain with the recipe itself (3 interleaved rounds, 40 updates timed after 20): 22,526 against 11,340 tok/s, 1.986x paired (1.975-1.989), for a 1.60 GiB higher allocator peak (12.88 against 11.28 GiB; driver 14.22 against 12.50).
   - The two fusions change the summation order of the weight and RMSNorm-gain gradients. Over the first 480 micro-steps the per-step losses of the two lines differ by at most 0.71% (mean 0.03%); two runs of the old line differ by up to 0.68%. Neither diverges over that span.

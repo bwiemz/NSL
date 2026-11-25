@@ -15,9 +15,10 @@
 //! (`NSL_TC_ATTN_LPT=0`) and rule 4b off (`NSL_ROPE_BWD_BF16=0`): main's
 //! computation. The loss streams and trained weights are compared as text:
 //!
-//! - the tensor-core forward with the CPU reference backward (`--deterministic`),
-//!   f32; with bf16 storage (which the CPU reference cannot read) and the
-//!   attention's output dropout, the tensor-core backward;
+//! - `--deterministic`, which takes the tensor-core backward (single writer),
+//!   f32, and bf16 storage with the attention's output dropout; the
+//!   tensor-core forward with the CPU reference backward (`NSL_FLASH_BWD_CPU=1`),
+//!   f32;
 //! - the tensor-core backward (`NSL_FLASH_BWD_CPU=0`), f32 and bf16;
 //! - the previous attention kernels (`NSL_TC_ATTENTION=0`), which copy the views;
 //! - `NSL_SDPA_GQA_EXPAND=1`;
@@ -221,14 +222,27 @@ const RULE_4B_OFF: &[(&str, &str)] = &[("NSL_ROPE_BWD_BF16", "0")];
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn the_head_layout_trains_like_main_under_deterministic() {
-    // Tensor-core forward in the head layout, CPU reference backward.
+    // `--deterministic` takes the tensor-core backward, which is deterministic
+    // itself (one writer per output element), in the head layout.
     let (new, _) = assert_main("det_f32", GPU, &[]);
+    assert_layout_kept(&new, true);
+    assert!(
+        new.stderr.contains("[flash-bwd] tensor-core backward dispatched"),
+        "--deterministic did not take the tensor-core backward:\n{}",
+        new.stderr
+    );
+    // Tensor-core forward in the head layout, CPU reference backward.
+    let cpu = [("NSL_FLASH_BWD_CPU", "1")];
+    let (new, _) = assert_main("det_f32_cpu", Arm { envs: &cpu, ..GPU }, &[]);
     assert_layout_kept(&new, false);
-    // bf16 storage: the CPU reference backward reads f32 only, so the
-    // tensor-core backward (deterministic itself) serves it; with the
-    // attention's output dropout.
-    let envs = [("NSL_FLASH_BWD_CPU", "0")];
-    let (new, _) = assert_main("det_bf16_drop", Arm { bf16: true, dropout: true, envs: &envs, ..GPU }, RULE_4B_OFF);
+    assert!(
+        new.stderr.contains("deterministic CPU reference backward forced"),
+        "the CPU reference backward did not run:\n{}",
+        new.stderr
+    );
+    // bf16 storage (which the CPU reference cannot read) with the attention's
+    // output dropout, under `--deterministic` alone.
+    let (new, _) = assert_main("det_bf16_drop", Arm { bf16: true, dropout: true, ..GPU }, RULE_4B_OFF);
     assert_layout_kept(&new, true);
 }
 

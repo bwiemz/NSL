@@ -323,8 +323,9 @@ fn param_dtype_refusals_are_compile_errors() {
 // GPU
 // ---------------------------------------------------------------------------
 
-/// `--deterministic` routes the attention backward to the host unless
-/// `NSL_FLASH_BWD_CPU=0`, which would take bf16 attention away.
+/// `--deterministic` takes the tensor-core attention backward where it applies
+/// and the host reference elsewhere, which would take bf16 attention away;
+/// `NSL_FLASH_BWD_CPU=0` keeps every backward on the GPU.
 const DET_ENV: [(&str, &str); 2] = [
     ("NSL_FLASH_BWD_CPU", "0"),
     ("NSL_BF16_CAST_CACHE_COUNTER", "1"),
