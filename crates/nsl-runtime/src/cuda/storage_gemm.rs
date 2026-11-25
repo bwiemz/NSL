@@ -210,7 +210,7 @@ pub(crate) unsafe fn gemm16_into(
 
 /// Is `t` a 2-D view of a contiguous `[cols, rows]` buffer transposed to
 /// `[rows, cols]` (what `.transpose(0, 1)` produces)?
-fn is_transposed_2d(t: &NslTensor) -> bool {
+pub(super) fn is_transposed_2d(t: &NslTensor) -> bool {
     t.ndim == 2 && unsafe { *t.strides == 1 && *t.strides.add(1) == *t.shape } && unsafe { *t.shape.add(1) } > 1
 }
 

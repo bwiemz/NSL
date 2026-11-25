@@ -42,6 +42,9 @@ pub(crate) mod lt_matmul;
 pub(crate) mod mx_quant;
 
 #[cfg(feature = "cuda")]
+pub(crate) mod mx_route;
+
+#[cfg(feature = "cuda")]
 pub(crate) mod storage_kernels;
 
 #[cfg(feature = "cuda")]

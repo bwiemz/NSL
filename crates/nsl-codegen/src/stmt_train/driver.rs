@@ -393,6 +393,8 @@ impl Compiler<'_> {
         // VarIds, like the placements above.
         self.storage_out.clear();
         self.storage_param_gemm.clear();
+        self.mx_gemm.clear();
+        self.mx_wgrad = false;
         // Item 6: the witness of the residual add + RMSNorm grouping, per train block.
         let (fused, fwd) = std::mem::take(&mut self.add_norm_fused);
         if fused > 0 {

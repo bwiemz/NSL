@@ -108,6 +108,45 @@ struct Entry {
     /// False = theta has moved since the image was last cast; the next
     /// acquire re-casts.
     valid: bool,
+    /// MXFP8 images of the same parameter, one per K direction
+    /// ([`MxOrient`]): allocated on first use, invalidated with `valid` by
+    /// every path that stales the bf16 image, freed with it.
+    mx: [MxImage; 2],
+}
+
+/// An MXFP8 image (`crate::mxfp8`): E4M3 data and its block scales.
+#[derive(Clone, Copy, Default)]
+struct MxImage {
+    data: u64,
+    scales: u64,
+    valid: bool,
+}
+
+/// Which K direction an MXFP8 weight image is quantized along. A weight
+/// `W [d_in, d_out]` feeds the forward with K = d_in (the image is the
+/// transpose, blocks along each column of W) and the input gradient with
+/// K = d_out (blocks along each row of W).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MxOrient {
+    /// Blocks along each row of the stored weight (`mx_quant::Rows`).
+    Rows = 0,
+    /// Blocks along each column, written transposed (`mx_quant::ColsT`).
+    ColsT = 1,
+}
+
+impl Entry {
+    /// Every device buffer this entry owns.
+    fn buffers(&self) -> impl Iterator<Item = u64> + '_ {
+        std::iter::once(self.buf16)
+            .chain(self.mx.iter().flat_map(|m| [m.data, m.scales]))
+            .filter(|&p| p != 0)
+    }
+}
+
+fn free_buffers(e: &Entry) {
+    for p in e.buffers() {
+        super::inner::free_managed(p as *mut std::ffi::c_void);
+    }
 }
 
 /// The images, held per DEVICE on [`CudaContext`](super::context::CudaContext)
@@ -154,6 +193,10 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 static HITS: AtomicU64 = AtomicU64::new(0);
 static RECASTS: AtomicU64 = AtomicU64::new(0);
 static EVICTIONS: AtomicU64 = AtomicU64::new(0);
+/// MXFP8 weight images served without quantizing / quantized (one per
+/// parameter, direction and optimizer step once warm).
+static MX_HITS: AtomicU64 = AtomicU64::new(0);
+static MX_REQUANTS: AtomicU64 = AtomicU64::new(0);
 
 /// `NSL_MATMUL_BF16_CAST_CACHE=0` kills the cache (fresh scratch every GEMM,
 /// the pre-cache behavior). Same read-once discipline as the mode resolvers.
@@ -211,22 +254,32 @@ pub(crate) fn note_param_stepped(data: u64, elems: usize) {
         match map.get_mut(&data) {
             Some(e) if e.elems == elems => {
                 e.valid = false;
-                0
+                for m in &mut e.mx {
+                    m.valid = false;
+                }
+                None
             }
             _ => {
                 // New registration, or the same pointer reincarnated with a
                 // different length (freed + recycled into a differently-sized
                 // param without the free hook seeing it, or a reshaped
-                // model). Replace wholesale; the displaced image is an
-                // eviction and is freed outside the lock.
-                map.insert(data, Entry { elems, buf16: 0, valid: false })
-                    .map_or(0, |e| e.buf16)
+                // model). Replace wholesale; the displaced images are an
+                // eviction and are freed outside the lock.
+                map.insert(
+                    data,
+                    Entry {
+                        elems,
+                        buf16: 0,
+                        valid: false,
+                        mx: Default::default(),
+                    },
+                )
             }
         }
     });
-    if old != 0 {
+    if let Some(old) = old {
         EVICTIONS.fetch_add(1, Ordering::Relaxed);
-        super::inner::free_managed(old as *mut std::ffi::c_void);
+        free_buffers(&old);
     }
     ACTIVE.store(true, Ordering::Release);
 }
@@ -346,13 +399,96 @@ pub(crate) fn evict(data: u64) {
     let removed = with_images(|map| map.remove(&data));
     if let Some(e) = removed {
         EVICTIONS.fetch_add(1, Ordering::Relaxed);
-        if e.buf16 != 0 {
-            // Free-after-enqueue is safe by the process stream invariant
-            // (see Bf16Scratch::drop); the nested free-hook probe finds no
-            // entry for the image pointer and falls straight through.
-            super::inner::free_managed(e.buf16 as *mut std::ffi::c_void);
-        }
+        // Free-after-enqueue is safe by the process stream invariant (see
+        // Bf16Scratch::drop); the nested free-hook probe finds no entry for
+        // an image pointer and falls straight through.
+        free_buffers(&e);
     }
+}
+
+/// The MXFP8 image of the registered parameter at `data` (`elems` f32
+/// elements) for direction `orient`: `Some((data, scales, needs_quant))`.
+/// `data_bytes` / `scale_bytes` size a first allocation. As [`acquire`], the
+/// entry is marked valid on the `needs_quant` hand-off, so the caller must
+/// launch the quantizer into the image at once. `None`: not a registered
+/// parameter (or allocation failed); quantize into scratch.
+pub(crate) fn acquire_mx(
+    data: u64,
+    elems: usize,
+    orient: MxOrient,
+    data_bytes: usize,
+    scale_bytes: usize,
+) -> Option<(u64, u64, bool)> {
+    if !ACTIVE.load(Ordering::Acquire) {
+        return None;
+    }
+    let o = orient as usize;
+    enum Probe {
+        Miss,
+        Ready(u64, u64, bool),
+        NeedsImage,
+    }
+    match with_images(|map| {
+        let Some(e) = map.get_mut(&data) else {
+            return Probe::Miss;
+        };
+        if e.elems != elems {
+            return Probe::Miss;
+        }
+        let m = &mut e.mx[o];
+        if m.data != 0 {
+            let needs = !m.valid;
+            m.valid = true;
+            if needs {
+                MX_REQUANTS.fetch_add(1, Ordering::Relaxed);
+            } else {
+                MX_HITS.fetch_add(1, Ordering::Relaxed);
+            }
+            return Probe::Ready(m.data, m.scales, needs);
+        }
+        Probe::NeedsImage
+    }) {
+        Probe::Miss => return None,
+        Probe::Ready(d, s, needs) => return Some((d, s, needs)),
+        Probe::NeedsImage => {}
+    }
+    // Allocate without the lock (see `acquire`), then install if the entry
+    // is still this parameter's and the image still missing.
+    let d = super::inner::alloc_managed(data_bytes) as u64;
+    let s = super::inner::alloc_managed(scale_bytes) as u64;
+    if d == 0 || s == 0 {
+        for p in [d, s].into_iter().filter(|&p| p != 0) {
+            super::inner::free_managed(p as *mut std::ffi::c_void);
+        }
+        return None;
+    }
+    let install = with_images(|map| match map.get_mut(&data) {
+        Some(e) if e.elems == elems && e.mx[o].data == 0 => {
+            e.mx[o] = MxImage {
+                data: d,
+                scales: s,
+                valid: true,
+            };
+            true
+        }
+        _ => false,
+    });
+    if install {
+        MX_REQUANTS.fetch_add(1, Ordering::Relaxed);
+        Some((d, s, true))
+    } else {
+        super::inner::free_managed(d as *mut std::ffi::c_void);
+        super::inner::free_managed(s as *mut std::ffi::c_void);
+        None
+    }
+}
+
+/// (MXFP8 image hits, quantizations).
+pub(crate) fn mx_stats() -> (u64, u64) {
+    (
+        MX_HITS.load(Ordering::Relaxed),
+        MX_REQUANTS.load(Ordering::Relaxed),
+    )
 }
 
 /// (hits, recasts, evictions) — see the counter docs.
@@ -383,17 +519,19 @@ pub(crate) fn reset_for_test() {
         HITS.store(0, Ordering::Relaxed);
         RECASTS.store(0, Ordering::Relaxed);
         EVICTIONS.store(0, Ordering::Relaxed);
+        MX_HITS.store(0, Ordering::Relaxed);
+        MX_REQUANTS.store(0, Ordering::Relaxed);
         return;
     }
     let drained: Vec<Entry> =
         with_images(|map| std::mem::take(map).into_values().collect());
     ACTIVE.store(false, Ordering::Release);
     for e in drained {
-        if e.buf16 != 0 {
-            super::inner::free_managed(e.buf16 as *mut std::ffi::c_void);
-        }
+        free_buffers(&e);
     }
     HITS.store(0, Ordering::Relaxed);
     RECASTS.store(0, Ordering::Relaxed);
     EVICTIONS.store(0, Ordering::Relaxed);
+    MX_HITS.store(0, Ordering::Relaxed);
+    MX_REQUANTS.store(0, Ordering::Relaxed);
 }

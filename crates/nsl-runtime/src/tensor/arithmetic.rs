@@ -1269,6 +1269,54 @@ pub extern "C" fn nsl_wgrad_fallback_count() -> i64 {
     WGRAD_FALLBACK_COUNT.load(std::sync::atomic::Ordering::Relaxed) as i64
 }
 
+/// [`nsl_tensor_wgrad_accum`] as an MXFP8 GEMM: `x` and `g` quantized to
+/// E4M3 down their token dimension with one UE8M0 scale per 32 tokens
+/// (`crate::mxfp8`), f32 accumulation into `m`. Codegen calls it for every
+/// fused weight gradient when the program asked for MXFP8 GEMMs. Anything
+/// outside the MXFP8 contract takes [`nsl_tensor_wgrad_accum`].
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_tensor_wgrad_accum_mx(m_ptr: i64, x_ptr: i64, g_ptr: i64, s: f64) {
+    #[cfg(feature = "cuda")]
+    {
+        let (m, x, g) = (
+            NslTensor::from_ptr_ref(m_ptr),
+            NslTensor::from_ptr_ref(x_ptr),
+            NslTensor::from_ptr_ref(g_ptr),
+        );
+        let (xs, gs, ms) = (shape_vec(x), shape_vec(g), shape_vec(m));
+        let ok = ms.len() == 2
+            && xs.len() >= 2
+            && xs.len() == gs.len()
+            && xs[..xs.len() - 1] == gs[..gs.len() - 1]
+            && xs[xs.len() - 1] == ms[0]
+            && gs[gs.len() - 1] == ms[1]
+            && m.device > 0
+            && x.device == m.device
+            && g.device == m.device
+            && m.is_contiguous()
+            && x.is_contiguous()
+            && g.is_contiguous();
+        if ok {
+            let n_rows: i64 = xs[..xs.len() - 1].iter().product();
+            if n_rows > 0
+                && crate::cuda::mx_route::wgrad_accum(
+                    m_ptr,
+                    x_ptr,
+                    g_ptr,
+                    n_rows as u64,
+                    ms[0] as u64,
+                    ms[1] as u64,
+                    s as f32,
+                )
+            {
+                WGRAD_FUSED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+    nsl_tensor_wgrad_accum(m_ptr, x_ptr, g_ptr, s)
+}
+
 /// Falls back to the exact decomposed chain whenever the fast path's
 /// preconditions do not hold, so correctness never depends on them.
 ///

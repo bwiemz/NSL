@@ -1002,6 +1002,14 @@ pub struct Compiler<'a> {
     /// bf16-stored parameter (`nsl_tensor_matmul_pdt`, the eager bf16 matmul
     /// mode's per-shape rule). Keyed and cleared like `storage_out`.
     pub(crate) storage_param_gemm: std::collections::HashSet<crate::wengert::VarId>,
+    /// `NSL_MXFP8_GEMMS=1`: the planned GEMMs of the train block being
+    /// lowered that read a parameter (`x @ W`, `g @ W^T`), lowered as MXFP8
+    /// GEMMs (`nsl_tensor_matmul_mx`, route 4 of `nsl_tensor_matmul_acc`).
+    /// Keyed and cleared like `storage_out`.
+    pub(crate) mx_gemm: std::collections::HashSet<crate::wengert::VarId>,
+    /// `NSL_MXFP8_GEMMS=1` for the train block being lowered: its fused
+    /// weight gradients call `nsl_tensor_wgrad_accum_mx`.
+    pub(crate) mx_wgrad: bool,
     /// Round-2 item 6: the RMSNorm outputs a grouped residual-add + RMSNorm launch
     /// (`wengert_lower::add_rmsnorm_groups`) produced at its Add, keyed by the norm op's
     /// result VarId and taken when that op is reached. Empty outside a lowering (a range
@@ -1360,6 +1368,8 @@ impl<'a> Compiler<'a> {
             arena_placements: HashMap::new(),
             storage_out: HashMap::new(),
             storage_param_gemm: std::collections::HashSet::new(),
+            mx_gemm: std::collections::HashSet::new(),
+            mx_wgrad: false,
             add_norm_stash: HashMap::new(),
             add_norm_groups: None,
             add_norm_fused: (0, 0),

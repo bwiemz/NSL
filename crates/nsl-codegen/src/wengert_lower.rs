@@ -2253,7 +2253,19 @@ fn lower_storage_op(
             "nsl_tensor_matmul_pdt",
             &[inputs[0], inputs[1]],
         ),
-        PrimalOp::Matmul => call(compiler, builder, "nsl_tensor_matmul_dt", &[inputs[0], inputs[1], dt]),
+        // `NSL_MXFP8_GEMMS=1`: a GEMM reading a parameter, in MXFP8.
+        PrimalOp::Matmul if compiler.mx_gemm.contains(&op.result) => call(
+            compiler,
+            builder,
+            "nsl_tensor_matmul_mx",
+            &[inputs[0], inputs[1], dt],
+        ),
+        PrimalOp::Matmul => call(
+            compiler,
+            builder,
+            "nsl_tensor_matmul_dt",
+            &[inputs[0], inputs[1], dt],
+        ),
         PrimalOp::Add | PrimalOp::Sub | PrimalOp::Mul | PrimalOp::Div => {
             let c = match &op.op {
                 PrimalOp::Add => dt_op::ADD,
@@ -2311,10 +2323,12 @@ fn lower_storage_op(
         PrimalOp::Passthrough(name) if name == "matmul_acc" => {
             // Route 3: a bf16 sum (the value's gradient is bf16), replayed as the
             // unfused bf16 GEMM, reduce and add; route 2: the GEMM the eager bf16 rule
-            // decides (`nsl_tensor_matmul_pdt`); route 1: `_dt` to f32.
+            // decides (`nsl_tensor_matmul_pdt`); route 4: route 1 as an MXFP8 GEMM
+            // (`NSL_MXFP8_GEMMS=1`); route 1: `_dt` to f32.
             let route = match storage {
                 crate::stmt_train::storage_plan::Storage::Bf16 => 3,
                 _ if compiler.storage_param_gemm.contains(&op.result) => 2,
+                _ if compiler.mx_gemm.contains(&op.result) => 4,
                 _ => 1,
             };
             let route = builder.ins().iconst(cl_types::I64, route);

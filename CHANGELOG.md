@@ -8,6 +8,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+<!-- FP8 phase 2 (2026-11-24): NSL_MXFP8_GEMMS=1 routes the parameter GEMMs to MXFP8. -->
+- **`NSL_MXFP8_GEMMS=1` (experimental, compile time) runs the GEMMs that read a parameter in MXFP8.**
+  - Under `precision="bf16"` the compiler lowers these GEMMs in MXFP8 instead of bf16 (`storage_plan::mx_projection_gemms`):
+    - the planned GEMMs that read a parameter or its last-two-axes transpose, `x @ W` (`nsl_tensor_matmul_mx`) and `g @ W^T` (alone, or summed into an f32 input gradient: `nsl_tensor_matmul_acc` route 4);
+    - every fused weight gradient (`nsl_tensor_wgrad_accum_mx`).
+  - In a transformer block these are the seven projections. The LM head and attention keep their own kernels.
+  - Operands are quantized along K as the GEMM needs (phase 1's quantizers): the forward reads the weight down its columns and the input gradient along its rows. The weight gradient reads the activation and the gradient down their token columns.
+  - A parameter's two images hang on the weight-cast cache entry. They are quantized once per optimizer step and freed or invalidated by everything that stales its bf16 image. Before the first step the weights are quantized into scratch.
+  - A shape outside the MXFP8 contract (K or N not a multiple of 32), or a device below compute capability 10.0, takes the bf16 path. `NSL_BF16_LT_COUNTER=1` prints `[mxfp8]` counts at exit: forward, input-gradient, summed input-gradient and weight-gradient GEMMs, declines, weight images quantized and reused.
+  - Refused at compile time without `precision="bf16"`, and with `param_dtype=`.
+  - Off by default until convergence at the production scales is measured.
+  - Speed, measured on the RTX PRO 4500 Blackwell (sm_120): perfcheck arm `nsl_bf16s_mx` against `nsl_bf16s`, the production flag line with `precision="bf16"`, same toolchain, interleaved rounds, median ms per update.
+    - Coder-1B: 1.280-1.290x over three clean rounds (967-977 against 751-757 ms). That matches phase 1's budget of about 1.3x.
+    - Coder-500M: 1.175-1.178x over two (523-524 against 444-446 ms).
+    - The allocator peak is 0.06 GiB higher at 1B and 0.15 GiB at 500M, for the weight images and the quantized operands.
+  - Verified:
+    - `mx_route_gpu` checks each entry point against the f64 product of the host-quantized operands, at non-square shapes, so an operand in the wrong orientation cannot pass. It also covers:
+      - route 4, out of place;
+      - the weight gradient accumulating, and overwriting a fresh accumulator full of stale values;
+      - a width outside the contract, which declines to bf16;
+      - a registered parameter: an image per direction, quantized once and reused, quantized again after a step, and dropped by a write, after which the product follows the new bytes.
+    - `mxfp8_gemm_gate`: a two-block grouped-query-attention + SwiGLU model on the production flag line runs all 112 forward, 112 input-gradient and 112 weight-gradient projection GEMMs in MXFP8 with no decline. Each weight image is quantized once per step and reused, the losses stay within 2.3% of bf16, and two `--deterministic` runs give the same bits.
+
 <!-- FP8 phase 1 (2026-11-24): MXFP8 quantizers and the cublasLt MXFP8 GEMM, not yet routed from training. -->
 - **MXFP8 GEMM building blocks: E4M3 operands with one power-of-two scale per 32 elements, multiplied by cublasLt.**
   - Why: GEMMs take about 70% of a production update, and they already run at cuBLAS's bf16 rate. On the RTX PRO 4500 Blackwell (sm_120), cublasLt's FP8 GEMMs run 1.7-2.4x the bf16 rate at every Coder-1B GEMM shape. With one UE8M0 scale per 32 elements along K (`VEC32_UE8M0`, the OCP MX format) they run 1.7-2.3x. Measured with the heuristic's best of 16 candidates.

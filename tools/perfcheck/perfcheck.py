@@ -329,6 +329,16 @@ def arm(name: str) -> Arm:
         "nsl_tf32": Arm(name, "nsl", "tf32", tuple(PROD_FLAGS)),
         "nsl_bf16": Arm(name, "nsl", "bf16", tuple(PROD_FLAGS), BF16),
         "nsl_bf16s": Arm(name, "nsl", "bf16", tuple(PROD_FLAGS), train_args=PRECISION_BF16),
+        # `nsl_bf16s` with the parameter GEMMs in MXFP8 (`NSL_MXFP8_GEMMS=1`, read by
+        # the compiler).
+        "nsl_bf16s_mx": Arm(
+            name,
+            "nsl",
+            "bf16",
+            tuple(PROD_FLAGS),
+            (("NSL_MXFP8_GEMMS", "1"),),
+            train_args=PRECISION_BF16,
+        ),
         "nsl_bf16split": Arm(name, "nsl", "bf16", tuple(PROD_FLAGS), train_args=PARAM_SPLIT),
         "nsl_bf16master": Arm(
             name,
@@ -1217,7 +1227,7 @@ def phase_split(r: dict[str, Any]) -> dict[str, float] | None:
 
 REPORT_ORDER = [
     "nsl_tf32", "nsl_tf32_nodrain", "nsl_tf32_blocks", "nsl_tf32_compress",
-    "nsl_bf16", "nsl_bf16s", "nsl_bf16split", "nsl_bf16splitm1", "nsl_bf16master",
+    "nsl_bf16", "nsl_bf16s", "nsl_bf16s_mx", "nsl_bf16split", "nsl_bf16splitm1", "nsl_bf16master",
     "nsl_bf16_nodrain", "nsl_bf16_blocks", "nsl_bf16_compress",
     "torch_tf32_eager_sel", "torch_tf32_eager_blocks", "torch_tf32_eager_none",
     "torch_bf16_eager_sel", "torch_bf16_eager_blocks", "torch_bf16_eager_none",
@@ -1307,6 +1317,7 @@ PAIRS = [
     ("torch_bf16_compile_sel", "nsl_tf32"),
     ("nsl_bf16", "nsl_tf32"),
     ("nsl_bf16s", "nsl_bf16"),
+    ("nsl_bf16s_mx", "nsl_bf16s"),
     ("nsl_bf16split", "nsl_bf16s"),
     ("nsl_bf16master", "nsl_bf16s"),
     ("nsl_bf16splitm1", "nsl_bf16s"),

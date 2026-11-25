@@ -376,6 +376,28 @@ pub extern "C" fn nsl_tensor_matmul_dt(a: i64, b: i64, out_dtype: i64) -> i64 {
     narrowed(r, tag)
 }
 
+/// `a @ b` with the result stored as `out_dtype`, as an MXFP8 GEMM: both
+/// operands quantized to E4M3 with one UE8M0 scale per 32 elements along K
+/// (`crate::mxfp8`), f32 accumulation. Codegen calls it for a projection
+/// GEMM (`b` a parameter or its last-two-axes transpose) when the program
+/// asked for MXFP8 GEMMs. A shape outside the MXFP8 contract, or a device
+/// without block-scaled FP8, takes [`nsl_tensor_matmul_dt`] (counted in the
+/// `[mxfp8]` line of `NSL_BF16_LT_COUNTER=1`).
+#[unsafe(no_mangle)]
+pub extern "C" fn nsl_tensor_matmul_mx(a: i64, b: i64, out_dtype: i64) -> i64 {
+    const NAME: &str = "nsl_tensor_matmul_mx";
+    refuse_tape(NAME);
+    let tag = out_tag(NAME, out_dtype);
+    check_operand(NAME, a);
+    check_operand(NAME, b);
+    #[cfg(feature = "cuda")]
+    if let Some(c) = crate::cuda::mx_route::matmul(a, b, tag) {
+        return c;
+    }
+    let _ = tag;
+    nsl_tensor_matmul_dt(a, b, out_dtype)
+}
+
 /// [`nsl_tensor_matmul_pdt`] calls that took f32 operands (the eager rule
 /// declined bf16, or one GEMM could not express the layout): reported by the
 /// parameter-storage teardown line, so a run whose large GEMMs land here is
@@ -497,12 +519,25 @@ pub fn matmul_acc_counts() -> (u64, u64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn nsl_tensor_matmul_acc(a: i64, b: i64, c: i64, route: i64) -> i64 {
     const NAME: &str = "nsl_tensor_matmul_acc";
-    if !(0..=3).contains(&route) {
+    if !(0..=4).contains(&route) {
         crate::fatal::die(
             crate::fatal::Fatal::Unsupported,
             &format!("{NAME}: unknown GEMM route {route}"),
         );
     }
+    // Route 4: route 1 as an MXFP8 GEMM (`nsl_tensor_matmul_mx`), route 1 when
+    // the shape is outside the MXFP8 contract.
+    #[cfg(feature = "cuda")]
+    if route == 4 {
+        refuse_tape(NAME);
+        check_operand(NAME, a);
+        check_operand(NAME, b);
+        if let Some(d) = crate::cuda::mx_route::matmul_acc(a, b, c) {
+            ACC_FUSED.fetch_add(1, Ordering::Relaxed);
+            return d;
+        }
+    }
+    let route = if route == 4 { 1 } else { route };
     if route != 0 {
         refuse_tape(NAME);
         let (ta, tb) = (check_operand(NAME, a), check_operand(NAME, b));

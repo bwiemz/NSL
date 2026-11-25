@@ -146,11 +146,14 @@ impl Compiler<'_> {
                         ));
                     }
                     let scale_val = b.ins().f64const(accum_scale);
-                    c.compile_call_by_name(
-                        b,
-                        "nsl_tensor_wgrad_accum",
-                        &[m_partial, x, g, scale_val],
-                    )?;
+                    // `NSL_MXFP8_GEMMS=1`: every fused weight gradient reads a
+                    // parameter's operands, so all of them go MXFP8.
+                    let wgrad = if c.mx_wgrad {
+                        "nsl_tensor_wgrad_accum_mx"
+                    } else {
+                        "nsl_tensor_wgrad_accum"
+                    };
+                    c.compile_call_by_name(b, wgrad, &[m_partial, x, g, scale_val])?;
                     return Ok(());
                 }
                 crate::wengert_lower::ParamGradSource::AccumulatedInPlace => {

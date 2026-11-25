@@ -541,11 +541,20 @@ extern "C" fn nsl_bf16_lt_atexit() {
     // so only these counts say the one-GEMM accumulation and the fused launch ran.
     let (acc_gemm, acc_decomposed) = crate::storage_dt::matmul_acc_counts();
     let (norm_fused, norm_pairs) = crate::residual_norm::counts();
+    // MXFP8 projection GEMMs (`nsl_tensor_matmul_mx` and friends): what ran in
+    // FP8, what declined to bf16, and how often a weight image was quantized
+    // against reused.
+    let [mx_fwd, mx_dgrad, mx_dgrad_acc, mx_wgrad, mx_declined] = crate::cuda::mx_route::counts();
+    let (mx_img_hits, mx_img_quants) = crate::cuda::bf16_cast_cache::mx_stats();
+    let (mx_issued, mx_tuned, mx_lt_declined) = crate::cuda::lt_matmul::mx_stats();
     let report = format!(
         "[bf16-lt] issued={issued} tuned={tuned} fallbacks={fallbacks}\n\
          [tf32-lt] issued={t_issued} tuned={t_tuned} fallbacks={t_fallbacks}\n\
          [dgrad-acc] one-gemm={acc_gemm} decomposed={acc_decomposed}\n\
-         [add-rmsnorm] fused={norm_fused} pairs={norm_pairs}\n"
+         [add-rmsnorm] fused={norm_fused} pairs={norm_pairs}\n\
+         [mxfp8] fwd={mx_fwd} dgrad={mx_dgrad} dgrad-acc={mx_dgrad_acc} wgrad={mx_wgrad} \
+         declined={mx_declined} weight-images quantized={mx_img_quants} reused={mx_img_hits} \
+         lt issued={mx_issued} tuned={mx_tuned} declined={mx_lt_declined}\n"
     );
     use std::io::Write;
     let _ = std::io::stderr().lock().write_all(report.as_bytes());
