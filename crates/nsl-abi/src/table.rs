@@ -381,6 +381,7 @@ macro_rules! for_each_runtime_fn {
             // void. Args (m_partial, x, g, s) — x/g are the PRE-transpose activation
             // and the upstream gradient; the transpose is folded into the GEMM.
             [abi_tensor] nsl_tensor_wgrad_accum(i64, i64, i64, f64) -> () = tensor::arithmetic::nsl_tensor_wgrad_accum;
+            [abi_tensor] nsl_tensor_wgrad_accum_mx(i64, i64, i64, f64) -> () = tensor::arithmetic::nsl_tensor_wgrad_accum_mx;
             // WRGA B.3 Task 4: fused LoRA/IA³ adapter matmul FFIs.
             // LoRA args: (x_ptr, w_ptr, a_ptr, b_ptr, scale_f64, kernel_handle_i64).
             // The scale is f64 at the FFI boundary because NSL FloatLiteral is f64;
@@ -604,6 +605,7 @@ macro_rules! for_each_runtime_fn {
             [abi_tensor] nsl_storage_dt_fallback_count() -> i64 = storage_dt::nsl_storage_dt_fallback_count;
             [abi_tensor] nsl_tensor_rmsnorm_dt(i64, i64, f64, i64) -> i64 = storage_dt::nsl_tensor_rmsnorm_dt;
             [abi_tensor] nsl_tensor_matmul_dt(i64, i64, i64) -> i64 = storage_dt::nsl_tensor_matmul_dt;
+            [abi_tensor] nsl_tensor_matmul_mx(i64, i64, i64) -> i64 = storage_dt::nsl_tensor_matmul_mx;
             // A GEMM planned only because it reads a bf16-stored parameter (`param_dtype=`):
             // the eager bf16 matmul mode's per-shape rule, over the parameter's exact f32 value
             // where that rule picks f32 operands.
@@ -1429,6 +1431,6 @@ mod tests {
     fn table_is_the_recorded_size() {
         // The count is pinned so a row dropped by a bad merge is noticed; move
         // it with a row that is deliberately added or removed.
-        assert_eq!(RUNTIME_ABI.len(), 694);
+        assert_eq!(RUNTIME_ABI.len(), 696);
     }
 }

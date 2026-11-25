@@ -1113,6 +1113,15 @@ pub static REGISTRY: &[EnvVar] = &[
         "Muon optimizer stage profiler: 1 = synced per-region wall time, 2 = enqueue-only host time; table printed to stderr at exit."
     ),
     var!(
+        "NSL_MXFP8_GEMMS",
+        Bool,
+        "1 only",
+        "off",
+        Behavior,
+        Compile,
+        "Experimental: under precision=\"bf16\", parameter GEMMs (fwd, dgrad, fused wgrad) in MXFP8: E4M3 + a UE8M0 scale per 32 along K. Needs CC 10.0+."
+    ),
+    var!(
         "NSL_NCCL_LIB_DIR",
         Path,
         "directory path (not validated)",

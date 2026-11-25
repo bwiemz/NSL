@@ -1734,9 +1734,9 @@ unsafe fn build_mx_plan(
 /// Issue `D = alpha · A^T B + beta · C` (column-major, `[m, n]`, `ldc`) with
 /// MXFP8 operands: `a` is `m` rows of `k` E4M3 bytes, `b` is `n` rows of
 /// `k`, each with its VEC32_UE8M0 scales in cublasLt's tiled layout. `c`
-/// (bf16 or f32) is read when `beta != 0` and written in place. Returns
-/// `false` (nothing written) when cublasLt declines the shape; the caller
-/// must then compute the product another way.
+/// (bf16 or f32) is read when `beta != 0`; `d` has its layout (`d == c`
+/// writes in place). Returns `false` (nothing written) when cublasLt
+/// declines the shape; the caller must then compute the product another way.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn matmul_mxfp8(
     m: i32,
@@ -1748,7 +1748,8 @@ pub(crate) unsafe fn matmul_mxfp8(
     b: *const std::ffi::c_void,
     b_scales: *const std::ffi::c_void,
     beta: f32,
-    c: *mut std::ffi::c_void,
+    c: *const std::ffi::c_void,
+    d: *mut std::ffi::c_void,
     ldc: i32,
     c_bf16: bool,
 ) -> bool {
@@ -1762,7 +1763,12 @@ pub(crate) unsafe fn matmul_mxfp8(
     }
     // cublasLt wants 16-byte operands and scale tensors. A misaligned buffer
     // would fail at launch and poison the shape's plan for aligned callers.
-    if !((a as usize) | (b as usize) | (c as usize) | (a_scales as usize) | (b_scales as usize))
+    if !((a as usize)
+        | (b as usize)
+        | (c as usize)
+        | (d as usize)
+        | (a_scales as usize)
+        | (b_scales as usize))
         .is_multiple_of(16)
     {
         return decline("mxfp8: an operand or scale buffer not 16-byte aligned");
@@ -1771,7 +1777,8 @@ pub(crate) unsafe fn matmul_mxfp8(
         MX_FALLBACKS.fetch_add(1, Ordering::Relaxed);
         return false;
     };
-    let align_log2 = ((a as usize) | (b as usize) | (c as usize) | 256).trailing_zeros();
+    let align_log2 =
+        ((a as usize) | (b as usize) | (c as usize) | (d as usize) | 256).trailing_zeros();
     let key: MxKey = (m, n, k, ldc, c_bf16, align_log2);
     let hit = with_mx_plans(|plans| {
         plans.get(&key).map(|p| {
@@ -1824,9 +1831,9 @@ pub(crate) unsafe fn matmul_mxfp8(
             b,
             bdesc,
             &beta as *const f32 as *const std::ffi::c_void,
-            c as *const std::ffi::c_void,
-            cdesc,
             c,
+            cdesc,
+            d,
             cdesc,
             &algo,
             ws_ptr as *mut std::ffi::c_void,

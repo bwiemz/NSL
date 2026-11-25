@@ -79,6 +79,7 @@ pub unsafe fn gemm(
             b as *const std::ffi::c_void,
             b_scales as *const std::ffi::c_void,
             beta,
+            c as *const std::ffi::c_void,
             c as *mut std::ffi::c_void,
             ldc,
             c_bf16,
@@ -89,4 +90,26 @@ pub unsafe fn gemm(
 /// `(issued, tuned shapes, declined)` MXFP8 GEMMs this process.
 pub fn stats() -> (u64, u64, u64) {
     crate::cuda::lt_matmul::mx_stats()
+}
+
+/// `[forward, input gradient, summed input gradient, weight gradient,
+/// declined]` projection GEMMs routed through MXFP8 (`NSL_MXFP8_GEMMS=1`)
+/// so far.
+pub fn route_counts() -> [u64; 5] {
+    crate::cuda::mx_route::counts()
+}
+
+/// Test hook: register the device tensor `t` (f32, contiguous, owning its
+/// storage) as a parameter the optimizer just stepped, as the fused AdamW
+/// step does, so its MXFP8 weight images are cached (and invalidated) like
+/// a training run's. Registration happens only in the bf16 matmul mode.
+#[cfg(feature = "test-hooks")]
+pub fn note_param_stepped_for_test(t: i64) {
+    let t = crate::tensor::NslTensor::from_ptr_ref(t);
+    crate::cuda::bf16_cast_cache::note_param_stepped(t.data as u64, t.len as usize);
+}
+
+/// `(weight images reused, weight images quantized)` so far.
+pub fn weight_image_counts() -> (u64, u64) {
+    crate::cuda::bf16_cast_cache::mx_stats()
 }

@@ -172,6 +172,55 @@ fn rope_grad_bf16_enabled() -> bool {
     std::env::var("NSL_ROPE_BWD_BF16").ok().as_deref() != Some("0")
 }
 
+/// `NSL_MXFP8_GEMMS=1`: the GEMMs that read a parameter run in MXFP8
+/// (E4M3 operands, one UE8M0 scale per 32 elements along K). Experimental:
+/// off by default until its convergence is measured.
+fn mxfp8_requested() -> bool {
+    std::env::var("NSL_MXFP8_GEMMS").ok().as_deref() == Some("1")
+}
+
+/// The planned GEMMs (`out`) that read a parameter: `x @ W` and
+/// `g @ W^T`, alone or as a summed input gradient (`matmul_acc`), where `W`
+/// is a `Param` load or its last-two-axes transpose. These are the
+/// projections of a transformer block; the LM head (fused linear
+/// cross-entropy) and attention are not GEMMs of the plan.
+pub fn mx_projection_gemms(
+    primal: &WengertList,
+    adjoint: &WengertList,
+    out: &HashMap<VarId, Storage>,
+) -> HashSet<VarId> {
+    let producer: HashMap<VarId, &WengertOp> = primal
+        .ops
+        .iter()
+        .chain(adjoint.ops.iter())
+        .map(|op| (op.result, op))
+        .collect();
+    let is_param = |v: VarId| matches!(producer.get(&v).map(|op| &op.op), Some(PrimalOp::Param(_)));
+    let is_weight = |v: VarId| {
+        is_param(v)
+            || producer.get(&v).is_some_and(|op| {
+                matches!(op.op, PrimalOp::Transpose { dim0, dim1 }
+                    if (dim0, dim1) == (usize::MAX - 1, usize::MAX) || (dim0, dim1) == (0, 1))
+                    && op.inputs.len() == 1
+                    && is_param(op.inputs[0])
+            })
+    };
+    primal
+        .ops
+        .iter()
+        .chain(adjoint.ops.iter())
+        .filter(|op| out.contains_key(&op.result))
+        .filter(|op| match &op.op {
+            PrimalOp::Matmul => op.inputs.len() == 2 && is_weight(op.inputs[1]),
+            PrimalOp::Passthrough(n) if n == "matmul_acc" => {
+                op.inputs.len() == 3 && is_weight(op.inputs[1])
+            }
+            _ => false,
+        })
+        .map(|op| op.result)
+        .collect()
+}
+
 fn only_reader<'a>(rd: &HashMap<VarId, Vec<&'a WengertOp>>, v: VarId) -> Option<&'a WengertOp> {
     match rd.get(&v).map(Vec::as_slice) {
         Some([one]) => Some(*one),
@@ -814,7 +863,20 @@ impl Compiler<'_> {
             param_paths,
         } = inputs;
         if !precision_bf16 {
+            if mxfp8_requested() {
+                return Err(crate::CodegenError::new(
+                    "NSL_MXFP8_GEMMS=1 routes the projection GEMMs of a precision=\"bf16\" train step \
+                     to MXFP8; this step is not precision=\"bf16\". Set precision=\"bf16\" or unset \
+                     NSL_MXFP8_GEMMS",
+                ));
+            }
             return Ok(Vec::new());
+        }
+        if mxfp8_requested() && param_dtype.is_some() {
+            return Err(crate::CodegenError::new(
+                "NSL_MXFP8_GEMMS=1 does not compose with param_dtype= yet: the MXFP8 weight images \
+                 are quantized from f32 master weights. Drop param_dtype= or unset NSL_MXFP8_GEMMS",
+            ));
         }
         let empty = HashMap::new();
         let clones = ccr_plan.as_ref().map_or(&empty, |p| &p.recompute_clones);
@@ -896,6 +958,18 @@ impl Compiler<'_> {
             );
         }
         self.storage_param_gemm = planned.param_gemm;
+        if mxfp8_requested() {
+            let mx = mx_projection_gemms(effective_primal, adjoint, &planned.out);
+            nsl_log::nsl_log!(
+                INFO,
+                "mxfp8",
+                "[mxfp8] {} parameter GEMM(s) and every fused weight gradient lowered MXFP8 \
+                 (NSL_MXFP8_GEMMS=1)",
+                mx.len()
+            );
+            self.mx_gemm = mx;
+            self.mx_wgrad = true;
+        }
         self.storage_out = planned.out;
         Ok(indices)
     }
