@@ -364,6 +364,16 @@ pub const EXEC_MARKERS: &[ExecMarker] = &[
          kernel or the unfused pair",
     ),
     m(
+        "[mxfp8]",
+        &[
+            "crates/nsl-runtime/src/args.rs",
+            "crates/nsl-codegen/src/stmt_train/storage_plan.rs",
+        ],
+        "the MXFP8 parameter GEMMs (NSL_MXFP8_GEMMS=1): how many the compiler lowered, and at \
+         exit (NSL_BF16_LT_COUNTER=1) the forward, input-gradient and weight-gradient GEMMs \
+         run, declines, and weight images quantized against reused",
+    ),
+    m(
         "[weight-stream]",
         &[
             "crates/nsl-codegen/src/stmt.rs",
