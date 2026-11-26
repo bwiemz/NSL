@@ -2,8 +2,8 @@
 //! The runtime's GPU dropout kernel from `cuda/fused_kernels.rs`, as KIR
 //! (new-roadmap item 5).
 //!
-//! `nsl_dropout_f32(inp, out, mask, len, threshold, scale, seed)`: inverted
-//! dropout with a counter-based hash, one thread per element.
+//! `nsl_dropout_f32(inp, out, mask, len, threshold, scale, seed, seed_ptr)`:
+//! inverted dropout with a counter-based hash, one thread per element.
 //!
 //! ```text
 //! c  = seed + i                        (64-bit)
@@ -19,6 +19,17 @@
 //! The draw is a pure function of the 64-bit counter `seed + i` (the host
 //! advances `seed` by `len` per launch), so the mask does not depend on the
 //! launch shape and no two elements of a run share a counter.
+//!
+//! # Where the counter base comes from
+//!
+//! The two forwards take the base by value (`seed`) when `seed_ptr` is null,
+//! and otherwise read it from the two u32 words at `seed_ptr`, low word first.
+//! The runtime passes a pointer only inside a `--cuda-graphs` region. There
+//! a by-value base changes every step, so the region's recorded argument
+//! bytes never repeat and the region never captures. Instead the base goes
+//! through a device word that a hooked upload writes, and the graph's memcpy
+//! node refreshes it at each replay. Outside a region the base stays by value,
+//! so there is no upload and no host stall. Every thread takes the same branch.
 //!
 //! Both halves of the counter enter the hash. The kernel used to hash
 //! `u32(seed + i)` alone, so the mask stream repeated exactly every 2^32
@@ -205,9 +216,64 @@ fn key_addr(b: &mut KirBuilder, key: VarId, w: DropoutKeyWord) -> VarId {
     addr
 }
 
-/// Entry for the key kernel: the thread with global index 0 writes the key,
-/// then every thread past `len` exits. Returns `(i, exit)` with the builder
-/// in the body block, as `index_and_bound` does.
+/// `hi << 32 | lo`.
+fn join_u64(b: &mut KirBuilder, lo: VarId, hi: VarId) -> VarId {
+    let lo64 = b.new_typed_var(KirType::U64);
+    b.emit(KirOp::Cast(lo64, lo, KirType::U64));
+    let hi64 = b.new_typed_var(KirType::U64);
+    b.emit(KirOp::Cast(hi64, hi, KirType::U64));
+    let shift = u32_const(b, 32);
+    let hi_shifted = b.new_typed_var(KirType::U64);
+    b.emit(KirOp::Shl(hi_shifted, hi64, shift));
+    let v = b.new_typed_var(KirType::U64);
+    b.emit(KirOp::Or(v, hi_shifted, lo64));
+    v
+}
+
+/// The forward's counter base: `seed` when `seed_ptr` is null, otherwise the
+/// two u32 words at `seed_ptr` (low first). See the module's "Where the counter
+/// base comes from". Branches from the current block and leaves the builder in
+/// the join block, whose parameter it returns.
+fn resolve_seed(b: &mut KirBuilder, seed: VarId, seed_ptr: VarId) -> VarId {
+    use AddressSpace::Global;
+    let load = b.new_block();
+    let join = b.new_block();
+    let base = b.add_block_param(join, KirType::U64);
+    let null = b.new_typed_var(u32_ptr());
+    b.emit(KirOp::Const(
+        null,
+        KirConst {
+            ty: u32_ptr(),
+            value: ConstValue::U64(0),
+        },
+    ));
+    let by_value = b.new_typed_var(KirType::Bool);
+    b.emit(KirOp::Cmp(by_value, seed_ptr, null, CmpOp::Eq));
+    b.terminate(KirTerminator::CondBranch(
+        by_value,
+        KirEdge::with(join, vec![seed]),
+        KirEdge::to(load),
+    ));
+
+    b.set_block(load);
+    let lo = b.new_typed_var(KirType::U32);
+    b.emit(KirOp::Load(lo, seed_ptr, Global));
+    let one = u64_const(b, 1);
+    let hi_addr = b.new_typed_var(u32_ptr());
+    b.emit(KirOp::PtrOffset(hi_addr, seed_ptr, one));
+    let hi = b.new_typed_var(KirType::U32);
+    b.emit(KirOp::Load(hi, hi_addr, Global));
+    let loaded = join_u64(b, lo, hi);
+    b.terminate(KirTerminator::Branch(KirEdge::with(join, vec![loaded])));
+
+    b.set_block(join);
+    base
+}
+
+/// Entry for the key kernel: resolve the counter base, let the thread with
+/// global index 0 write the key, then exit every thread past `len`. Returns
+/// `(i, seed)` and `exit`, with the builder in the body block, as
+/// `index_and_bound` does.
 fn index_write_key_and_bound(
     b: &mut KirBuilder,
     len: VarId,
@@ -215,7 +281,8 @@ fn index_write_key_and_bound(
     threshold: VarId,
     scale: VarId,
     seed: VarId,
-) -> (VarId, BlockId) {
+    seed_ptr: VarId,
+) -> ((VarId, VarId), BlockId) {
     use AddressSpace::Global;
     let entry = b.new_block();
     let write = b.new_block();
@@ -227,6 +294,8 @@ fn index_write_key_and_bound(
     b.emit(KirOp::GlobalId(i32_, 0));
     let i = b.new_typed_var(KirType::U64);
     b.emit(KirOp::Cast(i, i32_, KirType::U64));
+    // Resolved before the key is written: the key records the base used.
+    let seed = resolve_seed(b, seed, seed_ptr);
     let zero = u64_const(b, 0);
     let first = b.new_typed_var(KirType::Bool);
     b.emit(KirOp::Cmp(first, i, zero, CmpOp::Eq));
@@ -265,7 +334,7 @@ fn index_write_key_and_bound(
         KirEdge::to(body),
     ));
     b.set_block(body);
-    (i, exit)
+    ((i, seed), exit)
 }
 
 /// One builder for both forwards, so `out` is computed by the same code.
@@ -287,27 +356,31 @@ fn build_forward(saved: Saved) -> KernelIR {
     let len = b.add_param("len", KirType::U64, Global);
     let threshold = b.add_param("threshold", KirType::U32, Global);
     let scale = b.add_param("scale", KirType::F32, Global);
-    let seed_param = match saved {
-        Saved::Mask | Saved::Key => Some(b.add_param("seed", KirType::U64, Global)),
+    let seed_params = match saved {
+        Saved::Mask | Saved::Key => Some((
+            b.add_param("seed", KirType::U64, Global),
+            b.add_param("seed_ptr", u32_ptr(), Global),
+        )),
         Saved::Replay => None,
     };
 
-    let (i, exit) = match saved {
-        Saved::Mask | Saved::Replay => {
+    let ((i, seed), exit, valid) = match (saved, seed_params) {
+        (Saved::Mask, Some((seed, seed_ptr))) => {
             let (i, _, exit) = index_and_bound(&mut b, len);
-            (i, exit)
+            let seed = resolve_seed(&mut b, seed, seed_ptr);
+            ((i, seed), exit, None)
         }
-        Saved::Key => {
-            let seed = seed_param.expect("the key kernel takes the seed");
-            index_write_key_and_bound(&mut b, len, sink, threshold, scale, seed)
+        (Saved::Key, Some((seed, seed_ptr))) => {
+            let (is, exit) =
+                index_write_key_and_bound(&mut b, len, sink, threshold, scale, seed, seed_ptr);
+            (is, exit, None)
         }
-    };
-    let (seed, valid) = match seed_param {
-        Some(seed) => (seed, None),
-        None => {
+        (Saved::Replay, None) => {
+            let (i, _, exit) = index_and_bound(&mut b, len);
             let (seed, valid) = load_key_and_check(&mut b, sink, len, threshold, scale);
-            (seed, Some(valid))
+            ((i, seed), exit, Some(valid))
         }
+        _ => unreachable!("the forwards take a seed and the replay reads it from the key"),
     };
     let keep = emit_keep(&mut b, seed, i, threshold);
 
@@ -363,16 +436,7 @@ fn load_key_and_check(
     let len_lo = word(b, DropoutKeyWord::LenLo);
     let len_hi = word(b, DropoutKeyWord::LenHi);
 
-    // seed = hi << 32 | lo
-    let lo64 = b.new_typed_var(KirType::U64);
-    b.emit(KirOp::Cast(lo64, seed_lo, KirType::U64));
-    let hi64 = b.new_typed_var(KirType::U64);
-    b.emit(KirOp::Cast(hi64, seed_hi, KirType::U64));
-    let shift = u32_const(b, 32);
-    let hi_shifted = b.new_typed_var(KirType::U64);
-    b.emit(KirOp::Shl(hi_shifted, hi64, shift));
-    let seed = b.new_typed_var(KirType::U64);
-    b.emit(KirOp::Or(seed, hi_shifted, lo64));
+    let seed = join_u64(b, seed_lo, seed_hi);
 
     let scale_bits = b.new_typed_var(KirType::U32);
     b.emit(KirOp::Bitcast(scale_bits, scale));
@@ -401,13 +465,16 @@ fn load_key_and_check(
     (seed, valid.expect("five checks"))
 }
 
-/// Build `nsl_dropout_f32` in the hand kernel's instruction order.
+/// Build `nsl_dropout_f32(inp, out, mask, len, threshold, scale, seed,
+/// seed_ptr)`. The draw and the product keep the hand kernel's instruction
+/// order. The counter base is resolved first (see the module docs).
 pub fn build_dropout() -> KernelIR {
     build_forward(Saved::Mask)
 }
 
-/// Build `nsl_dropout_key_f32(inp, out, key, len, threshold, scale, seed)`:
-/// `nsl_dropout_f32`'s `out`, and the key instead of the mask.
+/// Build `nsl_dropout_key_f32(inp, out, key, len, threshold, scale, seed,
+/// seed_ptr)`: `nsl_dropout_f32`'s `out`, and the key instead of the mask.
+/// The key records the base the launch actually used.
 pub fn build_dropout_key() -> KernelIR {
     build_forward(Saved::Key)
 }
@@ -522,8 +589,9 @@ mod tests {
         );
         // The draw and the product are the same instructions in both: the
         // hash (6 multiplies + the index), one compare, the factor select
-        // and one multiply. The key kernel has no mask select and stores
-        // `out` once as f32 and the key as eight u32 words.
+        // and one multiply. So is the base prologue: one null test and the
+        // two words read through `seed_ptr`. The key kernel has no mask
+        // select and stores `out` once as f32 and the key as eight u32 words.
         for (form, in_mask, in_key) in [
             ("mul.lo.u32 ", 7, 7),
             ("xor.b32 ", 6, 6),
@@ -532,6 +600,9 @@ mod tests {
             ("mul.f32 ", 1, 1),
             ("st.global.f32 ", 2, 1),
             ("st.global.u32 ", 0, DROPOUT_KEY_WORDS),
+            ("ld.global.u32 ", 2, 2),
+            // The null test; the key kernel's second is `i == 0`.
+            ("setp.eq.u64 ", 1, 2),
         ] {
             assert_eq!(
                 mask.matches(form).count(),
@@ -544,7 +615,7 @@ mod tests {
                 "key kernel {form}: {key}"
             );
         }
-        for never in ["fma.", "mul.rn.f32", "add.f32", "ld.global.u32"] {
+        for never in ["fma.", "mul.rn.f32", "add.f32"] {
             assert!(!key.contains(never), "{never}: {key}");
         }
         // The magic is written, once.
@@ -617,6 +688,69 @@ mod tests {
             !ptx.contains("param_seed"),
             "the base comes from the key: {ptx}"
         );
+    }
+
+    /// Both forwards take the base by value and through a pointer, the pointer
+    /// last (the runtime's argument arrays depend on the order), and branch on
+    /// the pointer once. The key kernel writes the base it resolved, not
+    /// the by-value parameter: under a pointer that parameter is 0, and a key
+    /// recording 0 would make the backward redraw a different mask.
+    #[test]
+    fn the_forwards_resolve_the_base_from_a_value_or_a_pointer() {
+        // The null test, plus the key kernel's `i == 0`.
+        for (name, ptx, eqs) in [
+            (DROPOUT_NAME, String::from_utf8(dropout_ptx()).unwrap(), 1),
+            (
+                DROPOUT_KEY_NAME,
+                String::from_utf8(dropout_key_ptx()).unwrap(),
+                2,
+            ),
+        ] {
+            let sig = ptx
+                .split_once(&format!(".visible .entry {name}("))
+                .and_then(|(_, r)| r.split_once(')'))
+                .map(|(s, _)| s.to_string())
+                .unwrap_or_else(|| panic!("{name}: no entry: {ptx}"));
+            let params: Vec<&str> = sig
+                .split(',')
+                .map(|p| p.split_whitespace().last().unwrap_or(""))
+                .collect();
+            assert_eq!(params.len(), 8, "{name}: {sig}");
+            assert!(params[6].ends_with("seed"), "{name}: {sig}");
+            assert!(params[7].ends_with("seed_ptr"), "{name}: {sig}");
+            assert_eq!(ptx.matches("setp.eq.u64 ").count(), eqs, "{name}: {ptx}");
+        }
+        for ir in [build_dropout(), build_dropout_key()] {
+            let seed = ir
+                .params
+                .iter()
+                .find(|p| p.name == "seed")
+                .map(|p| p.id)
+                .expect("the forward takes a seed");
+            // The by-value parameter reaches the hash and the key's base words
+            // only through the join's block parameter: no op reads it.
+            for op in ir.blocks.iter().flat_map(|blk| blk.ops.iter()) {
+                let reads = match op {
+                    KirOp::Add(_, a, c) | KirOp::Shr(_, a, c) => *a == seed || *c == seed,
+                    KirOp::Cast(_, s, _) => *s == seed,
+                    KirOp::Store(_, v, _) => *v == seed,
+                    _ => false,
+                };
+                assert!(!reads, "{}: {op:?} reads the by-value seed", ir.name);
+            }
+            // ... and it does reach the join, as the null edge's argument.
+            let passed = ir.blocks.iter().any(|blk| {
+                matches!(
+                    &blk.terminator,
+                    Some(KirTerminator::CondBranch(_, t, _)) if t.args == vec![seed]
+                )
+            });
+            assert!(
+                passed,
+                "{}: the by-value seed never reaches the join",
+                ir.name
+            );
+        }
     }
 
     #[test]

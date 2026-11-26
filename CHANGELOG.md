@@ -2178,6 +2178,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **CUDA graphs: a region containing a dropout forward now captures.**
+  - Before, `--cuda-graphs` never captured a region holding a dropout forward (`nsl_dropout_key_f32`, or `nsl_dropout_f32` under `NSL_DROPOUT_REGEN=0`).
+    - The kernel took its counter base by value, and the base advances by every dropout's length each step.
+    - The region's recorded argument bytes therefore never repeated, and the region recorded forever.
+    - Found while tracing the arena-parity gate (#894): parameter byte 50 advanced by 0x80 every step.
+  - Both forward kernels take a trailing `seed_ptr`. When it is null they use `seed` as before. Otherwise they read the base from the two u32 words at `seed_ptr`, low word first.
+  - Only inside a graph region does the runtime pass the base through an 8-byte device word, with `seed = 0`. The word is written by `memcpy_htod`, an in-region pseudo-op whose payload each replay refreshes into the graph's staging buffer.
+  - Outside a region the base stays by value, so there is no upload and no host stall. The key kernel records the base it used, so the backward and the replay are unchanged.
+  - Measured on the `cuda_graph_gate` fixture with dropout 0.25 on both blocks (20 epochs, accumulation 2):
+    - Before: 2 of 4 regions captured, with 12 replays.
+    - After: 4 of 4, with 24 replays, the same as the dropout-free fixture.
+    - The loss stream is byte-identical to the eager run on both the key and the mask paths.
+  - Verified:
+    - New `cuda_graph_dropout_forwards_capture_and_redraw_every_step_gpu`. It requires the capture and replay counts of the dropout-free control, and a loss stream byte-identical to eager. Two mutants fail it:
+      - the base passed by value again fails the capture count;
+      - a constant base in the word fails the loss stream.
+    - The interpreter gates (`dropout_kir_equivalence`, `dropout_regen_kir_equivalence`) also run each forward with the base in a word and a decoy by value. Through the word, every byte of memory matches the by-value launch, the key's base words included, and the mutation tests try both forms.
 - **bf16 parameter storage.**
   - `print` of a bf16 or f16 tensor showed `?` for every element; it prints the values.
   - Under `--weight-stream`, a callback whose only model read sat inside a conditional expression, a lambda or another expression the callback analysis did not walk ran without the residency bracket, on evicted (null) parameters. A conservative scan of the whole callback now brackets it (with writeback).
