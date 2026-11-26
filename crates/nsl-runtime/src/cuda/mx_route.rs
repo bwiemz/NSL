@@ -149,6 +149,24 @@ fn dims_ok(m: i64, n: i64, k: i64) -> bool {
         && k <= i64::from(i32::MAX)
 }
 
+/// Whether the quantizers take the operands of a [`product`] GEMM (`m` rows
+/// of `k` activations; the weight `[k, n]`, or `[n, k]` when `transb`).
+/// `quant_rows` indexes its 4-element groups in 32 bits and `quant_cols_t`'s
+/// grid holds at most 65,535 tiles of 32 rows; past either they assert, so
+/// an operand that large must decline to bf16 here, not panic there.
+fn quant_limits_ok(m: usize, n: usize, k: usize, transb: bool) -> bool {
+    let rows_ok = |rows: usize| {
+        rows.checked_mul(k)
+            .is_some_and(|elems| u32::try_from(elems / 4).is_ok())
+    };
+    rows_ok(m)
+        && if transb {
+            rows_ok(n)
+        } else {
+            k / nsl_kir::kernels::mx_quant::MX_TILE as usize <= 65_535
+        }
+}
+
 /// A new contiguous tensor of `shape` and dtype `tag` on `device`.
 fn new_tensor(shape: &[i64], tag: u16, device: u8) -> (i64, u64) {
     let total: i64 = shape.iter().product();
@@ -213,7 +231,7 @@ fn product(a_ptr: i64, b_ptr: i64, out_tag: u16, acc: Option<i64>) -> Option<i64
     };
     let m = a.len / k;
     let n = b_cols;
-    if !dims_ok(m, n, k) {
+    if !dims_ok(m, n, k) || !quant_limits_ok(m as usize, n as usize, k as usize, transb) {
         return decline(None);
     }
     let mut out_shape: Vec<i64> = a_shape.to_vec();
@@ -364,4 +382,36 @@ pub(crate) fn wgrad_accum(
     super::inner::sync_after_kernel();
     WGRAD.fetch_add(1, Ordering::Relaxed);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quant_limits_ok;
+
+    #[test]
+    fn in_range_operands_pass() {
+        assert!(quant_limits_ok(8192, 4096, 4096, false));
+        assert!(quant_limits_ok(8192, 4096, 4096, true));
+    }
+
+    #[test]
+    fn an_activation_past_the_32_bit_group_index_declines() {
+        // 2^20 tokens x 2^14 = 2^34 elements, 2^32 groups of 4: one past u32.
+        assert!(!quant_limits_ok(1 << 20, 4096, 1 << 14, false));
+        assert!(!quant_limits_ok(1 << 20, 4096, 1 << 14, true));
+        // One group under the limit still runs.
+        assert!(quant_limits_ok((1 << 20) - 1, 4096, 1 << 14, false));
+    }
+
+    #[test]
+    fn a_transposed_weight_past_the_32_bit_group_index_declines() {
+        assert!(!quant_limits_ok(32, 1 << 20, 1 << 14, true));
+    }
+
+    #[test]
+    fn a_forward_weight_past_the_column_quantizer_grid_declines() {
+        // K = 65,536 tiles of 32 rows: one past the grid's y extent.
+        assert!(!quant_limits_ok(32, 32, 65_536 * 32, false));
+        assert!(quant_limits_ok(32, 32, 65_535 * 32, false));
+    }
 }
