@@ -51,6 +51,8 @@ use interp::*;
 const INP: u64 = 0x1000_0000;
 const OUT: u64 = 0x2000_0000;
 const MASK: u64 = 0x3000_0000;
+/// The device word a `--cuda-graphs` region passes the counter base through.
+const SEED_WORD: u64 = 0x4000_0000;
 const TAIL: usize = 300;
 const POISON: u32 = 0xA5A5_A5A5;
 const IN_TAIL: u32 = 0x3FC0_0000; // 1.5
@@ -190,7 +192,32 @@ fn cases() -> Vec<Case> {
     ]
 }
 
+/// How a launch passes the counter base (see `nsl_kir::kernels::dropout`,
+/// "Where the counter base comes from").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Base {
+    /// `seed` by value and a null `seed_ptr`: every launch outside a
+    /// `--cuda-graphs` region, and the only form the hand kernel knows.
+    Value,
+    /// The base in an 8-byte device word at `seed_ptr`, low word first. The
+    /// by-value `seed` holds a decoy, so a kernel reading the wrong one fails.
+    Pointer,
+}
+
+const BASES: [Base; 2] = [Base::Value, Base::Pointer];
+
+/// The by-value `seed` of a pointer launch: never the case's base.
+fn decoy(seed: u64) -> u64 {
+    !seed ^ 0x0123_4567_89AB_CDEF
+}
+
 fn launch(ptx: &str, c: Case, order: Order) -> (Vec<u32>, Vec<Vec<u8>>) {
+    launch_base(ptx, c, order, Base::Value)
+}
+
+/// `launch` with the base passed as `base` says. Returns the input, output and
+/// mask segments. Under `Base::Pointer`, it checks that the seed word is only read.
+fn launch_base(ptx: &str, c: Case, order: Order, base: Base) -> (Vec<u32>, Vec<Vec<u8>>) {
     let x = inputs(c.len, c.seed ^ 0x55);
     let mut inp = x.clone();
     inp.extend(vec![IN_TAIL; TAIL]);
@@ -199,6 +226,13 @@ fn launch(ptx: &str, c: Case, order: Order) -> (Vec<u32>, Vec<Vec<u8>>) {
         Segment { base: OUT, bytes: le32(&vec![POISON; c.len + TAIL]) },
         Segment { base: MASK, bytes: le32(&vec![POISON; c.len + TAIL]) },
     ];
+    let (seed, seed_ptr) = match base {
+        Base::Value => (c.seed, 0),
+        Base::Pointer => {
+            global.push(Segment { base: SEED_WORD, bytes: c.seed.to_le_bytes().to_vec() });
+            (decoy(c.seed), SEED_WORD)
+        }
+    };
     let args: HashMap<String, u64> = [
         ("inp", INP),
         ("out", OUT),
@@ -206,7 +240,8 @@ fn launch(ptx: &str, c: Case, order: Order) -> (Vec<u32>, Vec<Vec<u8>>) {
         ("len", c.len as u64),
         ("threshold", c.threshold as u64),
         ("scale", c.scale.to_bits() as u64),
-        ("seed", c.seed),
+        ("seed", seed),
+        ("seed_ptr", seed_ptr),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -231,6 +266,10 @@ fn launch(ptx: &str, c: Case, order: Order) -> (Vec<u32>, Vec<Vec<u8>>) {
         };
         run_cta(&mut l, order);
     }
+    if base == Base::Pointer {
+        let word = global.pop().expect("the seed word");
+        assert_eq!(word.bytes, c.seed.to_le_bytes(), "{c:?}: the seed word is only read");
+    }
     (x, global.into_iter().map(|s| s.bytes).collect())
 }
 
@@ -245,7 +284,10 @@ fn the_kir_kernel_agrees_with_the_hand_written_one_bit_for_bit() {
     let (hand, kir) = (hand_ptx(), kir_ptx());
     for c in cases() {
         for order in ORDERS {
-            assert!(launch(&hand, c, order).1 == launch(&kir, c, order).1, "{c:?} {order:?}");
+            let want = launch(&hand, c, order).1;
+            for base in BASES {
+                assert!(launch_base(&kir, c, order, base).1 == want, "{c:?} {order:?} {base:?}");
+            }
         }
     }
 }
@@ -254,8 +296,8 @@ fn the_kir_kernel_agrees_with_the_hand_written_one_bit_for_bit() {
 fn every_element_is_the_hashs_decision() {
     let mut kept_any = false;
     let mut dropped_any = false;
-    for c in cases() {
-        let (x, mem) = launch(&kir_ptx(), c, Order::Ascending);
+    for (c, base) in cases().into_iter().flat_map(|c| BASES.map(|b| (c, b))) {
+        let (x, mem) = launch_base(&kir_ptx(), c, Order::Ascending, base);
         let (out, mask) = (words(&mem[1]), words(&mem[2]));
         for i in 0..c.len {
             let keep = hash(c.seed.wrapping_add(i as u64)) < c.threshold;
@@ -308,10 +350,15 @@ fn masks_2_pow_32_counters_apart_are_different_masks() {
     assert_eq!(old_mask(42), old_mask(42 + (1 << 32)));
 }
 
+/// The hand kernel's parameters, in order, and then `seed_ptr` (a u64): the
+/// one deliberate change to the FFI, made so a `--cuda-graphs` region can
+/// capture a dropout (the runtime's argument arrays list it last).
 #[test]
 fn the_kir_kernel_keeps_the_ffi_signature_and_entry_name() {
     let (h, k) = (hand_ptx(), kir_ptx());
-    assert_eq!(parse_signature(&k), parse_signature(&h));
+    let mut want = parse_signature(&h);
+    want.push((".u64".to_string(), "seed_ptr".to_string()));
+    assert_eq!(parse_signature(&k), want);
     for p in [&h, &k] {
         assert!(p.contains(&format!(".visible .entry {DROPOUT_NAME}(")));
     }
@@ -332,16 +379,23 @@ fn the_arithmetic_is_spelled_as_in_the_hand_kernel() {
 // Mutation tests
 // ---------------------------------------------------------------------------
 
+/// Whether some case, schedule or base form tells the mutant from the hand
+/// kernel. Both base forms are tried, so a mutant that only breaks the pointer
+/// read (which the by-value launches never take) is caught too.
 fn caught(mutate: impl Fn(&str) -> String) -> bool {
     let hand = hand_ptx();
     let mutant = mutate(&kir_ptx());
     cases().into_iter().any(|c| {
         ORDERS.into_iter().any(|o| {
             let expect = launch(&hand, c, o).1;
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| launch(&mutant, c, o).1)) {
-                Ok(mem) => mem != expect,
-                Err(_) => true,
-            }
+            BASES.into_iter().any(|base| {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    launch_base(&mutant, c, o, base).1
+                })) {
+                    Ok(mem) => mem != expect,
+                    Err(_) => true,
+                }
+            })
         })
     })
 }
@@ -373,7 +427,7 @@ fn relaxing_the_bound_or_ignoring_the_block_index_is_caught() {
 fn nudging_an_element_size_is_caught() {
     let k = kir_ptx();
     let sites = k.matches(", 4;").count();
-    assert_eq!(sites, 3, "the input load and the two stores: {k}");
+    assert_eq!(sites, 4, "the input load, the two stores and the base's high word: {k}");
     for i in 0..sites {
         assert!(caught(|p| nudge(p, ", 4;", ", 8;", i)), "site {i}");
     }
@@ -381,7 +435,7 @@ fn nudging_an_element_size_is_caught() {
 
 #[test]
 fn every_parameter_slot_is_live() {
-    let ptrs = ["inp", "out", "mask"];
+    let ptrs = ["inp", "out", "mask", "seed_ptr"];
     let scalars = ["len", "seed"];
     for names in [&ptrs[..], &scalars[..]] {
         for (j, name) in names.iter().enumerate() {
@@ -428,9 +482,12 @@ fn ignoring_the_high_word_of_the_counter_is_caught() {
     let k = kir_ptx();
     // One 64-bit shift, by the one 32 in the module (the amount may sit in
     // a register, so the constant is nudged where it is written).
-    assert_eq!((k.matches("shr.u64 ").count(), k.matches(", 32;").count()), (1, 1), "{k}");
-    assert!(caught(|p| nudge(p, ", 32;", ", 31;", 0)), "high word taken one bit low");
-    assert!(caught(|p| nudge(p, ", 32;", ", 33;", 0)), "high word taken one bit high");
+    // The other 32 joins the two words read through `seed_ptr` into the base.
+    assert_eq!((k.matches("shr.u64 ").count(), k.matches(", 32;").count()), (1, 2), "{k}");
+    for i in 0..2 {
+        assert!(caught(|p| nudge(p, ", 32;", ", 31;", i)), "32 (occurrence {i}) one bit low");
+        assert!(caught(|p| nudge(p, ", 32;", ", 33;", i)), "32 (occurrence {i}) one bit high");
+    }
 
     // The key add is the one `add.u32` after the high word is taken.
     let after = k.lines().position(|l| l.contains("shr.u64 ")).unwrap();

@@ -9693,6 +9693,33 @@ pub(crate) fn gpu_maxpool2d_f32(
 // GPU Dropout (inverted dropout with per-element PRNG)
 // ---------------------------------------------------------------------------
 
+/// The counter-base arguments of a dropout forward launch: `(seed, seed_ptr)`.
+///
+/// Outside a `--cuda-graphs` region the base goes by value and `seed_ptr` is
+/// null. Inside one, a by-value base would change the launch's argument bytes
+/// every step (the counter advances by every dropout's length), so the
+/// region's digest would never repeat and the region would never capture.
+/// There the base goes into an 8-byte device word through `memcpy_htod`. An
+/// in-region upload is a pseudo-op identified by (dst, len), and its payload
+/// is refreshed into the graph's staging buffer at every replay. The by-value
+/// argument is then 0, and the kernel reads the word (see
+/// `nsl_kir::kernels::dropout`, "Where the counter base comes from").
+///
+/// Only in a region: outside one `memcpy_htod` is a synchronous pageable copy,
+/// which would stall the host once per dropout for nothing. The caller frees a
+/// non-null word after the launch, as other one-launch uploads are freed.
+#[cfg(feature = "cuda")]
+fn dropout_seed_args(seed: u64) -> (u64, *mut std::ffi::c_void) {
+    if !crate::cuda::graph_capture::in_region() {
+        return (seed, std::ptr::null_mut());
+    }
+    let word = inner::alloc_managed(8);
+    // The kernel reads two u32 words, low first: the little-endian u64.
+    let bytes = seed.to_le_bytes();
+    inner::memcpy_htod(word, bytes.as_ptr().cast(), bytes.len());
+    (0, word)
+}
+
 /// GPU dropout: out[i] = keep ? input[i] * scale : 0, mask[i] = keep ? 1 : 0.
 /// Uses a hash-based PRNG seeded from a global counter for per-element randomness.
 /// Returns (output_ptr, mask_ptr) — mask is f32 on GPU for backward pass.
@@ -9720,6 +9747,7 @@ pub(crate) fn gpu_dropout_f32(input_ptr: i64, p: f64) -> (i64, i64) {
     // training checkpoint can capture and restore it, and so `--seed` can
     // key it — see that module's header.
     let seed = crate::rng_state::gpu_dropout_next_seed(len);
+    let (seed, seed_word) = dropout_seed_args(seed);
 
     let mut inp_data = input.data as u64;
     let mut out_val = out_data as u64;
@@ -9728,8 +9756,9 @@ pub(crate) fn gpu_dropout_f32(input_ptr: i64, p: f64) -> (i64, i64) {
     let mut thresh_val = threshold;
     let mut scale_val = scale;
     let mut seed_val = seed;
+    let mut seed_ptr_val = seed_word as u64;
 
-    let args: [*mut std::ffi::c_void; 7] = [
+    let args: [*mut std::ffi::c_void; 8] = [
         &mut inp_data as *mut _ as *mut std::ffi::c_void,
         &mut out_val as *mut _ as *mut std::ffi::c_void,
         &mut mask_val as *mut _ as *mut std::ffi::c_void,
@@ -9737,6 +9766,7 @@ pub(crate) fn gpu_dropout_f32(input_ptr: i64, p: f64) -> (i64, i64) {
         &mut thresh_val as *mut _ as *mut std::ffi::c_void,
         &mut scale_val as *mut _ as *mut std::ffi::c_void,
         &mut seed_val as *mut _ as *mut std::ffi::c_void,
+        &mut seed_ptr_val as *mut _ as *mut std::ffi::c_void,
     ];
 
     let block = 256i64;
@@ -9746,6 +9776,7 @@ pub(crate) fn gpu_dropout_f32(input_ptr: i64, p: f64) -> (i64, i64) {
         fused_kernels::dropout_f32_ptx().as_ptr(), c"nsl_dropout_f32".as_ptr().cast(),
         [grid, 1, 1], [block, 1, 1], &args, 0,
     );
+    inner::free_managed(seed_word);
     assert_eq!(result as u32, 0, "GPU dropout kernel failed: {:?}", result);
     inner::sync_after_kernel();
 
@@ -9802,6 +9833,7 @@ pub(crate) fn gpu_dropout_key_f32(input_ptr: i64, p: f64) -> (i64, i64) {
     // Claimed exactly as `gpu_dropout_f32` claims it: the stream (and the
     // counter a checkpoint saves) does not depend on which kernel runs.
     let seed = crate::rng_state::gpu_dropout_next_seed(len);
+    let (seed, seed_word) = dropout_seed_args(seed);
 
     let mut inp_data = input.data as u64;
     let mut out_val = out_data as u64;
@@ -9810,7 +9842,8 @@ pub(crate) fn gpu_dropout_key_f32(input_ptr: i64, p: f64) -> (i64, i64) {
     let mut thresh_val = threshold;
     let mut scale_val = scale;
     let mut seed_val = seed;
-    let args: [*mut std::ffi::c_void; 7] = [
+    let mut seed_ptr_val = seed_word as u64;
+    let args: [*mut std::ffi::c_void; 8] = [
         &mut inp_data as *mut _ as *mut std::ffi::c_void,
         &mut out_val as *mut _ as *mut std::ffi::c_void,
         &mut key_val as *mut _ as *mut std::ffi::c_void,
@@ -9818,6 +9851,7 @@ pub(crate) fn gpu_dropout_key_f32(input_ptr: i64, p: f64) -> (i64, i64) {
         &mut thresh_val as *mut _ as *mut std::ffi::c_void,
         &mut scale_val as *mut _ as *mut std::ffi::c_void,
         &mut seed_val as *mut _ as *mut std::ffi::c_void,
+        &mut seed_ptr_val as *mut _ as *mut std::ffi::c_void,
     ];
     let block = 256i64;
     // At least one block: the first thread writes the key whatever `len` is.
@@ -9830,6 +9864,7 @@ pub(crate) fn gpu_dropout_key_f32(input_ptr: i64, p: f64) -> (i64, i64) {
         &args,
         0,
     );
+    inner::free_managed(seed_word);
     assert_eq!(
         result as u32, 0,
         "GPU dropout (key) kernel failed: {:?}",

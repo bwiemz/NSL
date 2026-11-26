@@ -50,6 +50,8 @@ const OUT: u64 = 0x2000_0000;
 const SINK: u64 = 0x3000_0000; // the mask, or the key
 const GRAD: u64 = 0x4000_0000;
 const DX: u64 = 0x5000_0000;
+/// The device word a `--cuda-graphs` region passes the counter base through.
+const SEED_WORD: u64 = 0x6000_0000;
 const TAIL: usize = 300;
 const POISON: u32 = 0xA5A5_A5A5;
 
@@ -166,16 +168,31 @@ fn launch(ptx: &str, args: &HashMap<String, u64>, mut global: Vec<Segment>, len:
 
 /// A forward launch of the mask kernel (`key = false`) or the key kernel:
 /// `(input, out, sink)` words, the sink holding `len` mask words or the key.
+/// The counter base goes by value, as everywhere outside a `--cuda-graphs`
+/// region.
 fn forward(c: Case, key: bool, order: Order) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    forward_base(c, key, order, false)
+}
+
+/// `forward`, with the base passed through a device word when `via_word` is set,
+/// as inside a `--cuda-graphs` region. The by-value `seed` then holds a decoy,
+/// so a kernel that reads the wrong one fails. The word must only be read.
+fn forward_base(c: Case, key: bool, order: Order, via_word: bool) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
     let x = values(c.len, c.seed ^ 0x55);
     let mut inp = x.clone();
     inp.extend(vec![0x3FC0_0000; TAIL]);
     let sink_words = if key { DROPOUT_KEY_WORDS } else { c.len } + TAIL;
-    let global = vec![
+    let mut global = vec![
         Segment { base: INP, bytes: le32(&inp) },
         Segment { base: OUT, bytes: le32(&vec![POISON; c.len + TAIL]) },
         Segment { base: SINK, bytes: le32(&vec![POISON; sink_words]) },
     ];
+    let (seed, seed_ptr) = if via_word {
+        global.push(Segment { base: SEED_WORD, bytes: c.seed.to_le_bytes().to_vec() });
+        (!c.seed ^ 0x0123_4567_89AB_CDEF, SEED_WORD)
+    } else {
+        (c.seed, 0)
+    };
     let a = args(&[
         ("inp", INP),
         ("out", OUT),
@@ -183,10 +200,15 @@ fn forward(c: Case, key: bool, order: Order) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
         ("len", c.len as u64),
         ("threshold", c.threshold() as u64),
         ("scale", c.scale().to_bits() as u64),
-        ("seed", c.seed),
+        ("seed", seed),
+        ("seed_ptr", seed_ptr),
     ]);
     let ptx = text(if key { dropout_key_ptx() } else { dropout_ptx() });
     let mut mem = launch(&ptx, &a, global, c.len, order);
+    if via_word {
+        let word = mem.pop().unwrap();
+        assert_eq!(word, words(&c.seed.to_le_bytes()), "{c:?}: the seed word is only read");
+    }
     let sink = mem.pop().unwrap();
     let out = mem.pop().unwrap();
     (x, out, sink)
@@ -273,6 +295,28 @@ fn the_key_kernel_writes_the_mask_kernels_output_and_its_key() {
             assert!(key[DROPOUT_KEY_WORDS..].iter().all(|&w| w == POISON), "{c:?}: written past the key");
         }
     }
+}
+
+/// Inside a `--cuda-graphs` region the base comes through a device word. Both
+/// forwards then write what the by-value launch writes, byte for byte. That
+/// includes the key's two base words, which the backward and the replay redraw
+/// from, so the gradient is unchanged too.
+#[test]
+fn a_base_read_through_the_word_is_the_by_value_launch_bit_for_bit() {
+    for c in cases() {
+        for order in ORDERS {
+            for key in [false, true] {
+                let by_value = forward(c, key, order);
+                let via_word = forward_base(c, key, order, true);
+                assert_eq!(via_word, by_value, "{c:?} {order:?} key={key}");
+            }
+        }
+    }
+    // An empty launch reads the word too: its key holds the word's base.
+    let c = Case { len: 0, p: 0.1, seed: (7 << 32) + 99 };
+    let (_, _, key) = forward_base(c, true, Order::Ascending, true);
+    assert_eq!(key[DropoutKeyWord::SeedLo as usize], 99);
+    assert_eq!(key[DropoutKeyWord::SeedHi as usize], 7);
 }
 
 /// The runtime launches the key kernel with at least one block, so a launch

@@ -724,6 +724,111 @@ fn bf16_cast_cache_is_invisible_in_the_loss_stream_gpu() {
     );
 }
 
+/// Each block's down projection under dropout 0.25: two forward dropouts per step.
+const DROPOUT: (&str, &str) = (
+    "let f = silu(h @ self.w_up) @ self.w_down",
+    "let f = dropout(silu(h @ self.w_up) @ self.w_down, 0.25, true)",
+);
+
+/// A dropout forward used to keep every region it sat in from ever capturing.
+/// Its counter base went to the kernel by value and advances by every
+/// dropout's length each step, so the region's recorded argument bytes never
+/// repeated. Inside a region the base now goes through a device word, written
+/// by an upload whose payload each replay refreshes. Both forward kernels are
+/// checked: the key (the default) and the f32 mask (`NSL_DROPOUT_REGEN=0`).
+///
+/// 1. With dropout, as many regions capture and replay as without it. Before
+///    the fix the forward regions recorded forever and `captured` fell short.
+/// 2. The loss stream is byte-identical to the eager run. A replay that kept the
+///    captured base would draw the capture step's masks again in every later
+///    step, and the losses would part from eager at the first replay.
+/// 3. Dropout really ran: its losses are not the dropout-free run's, and the
+///    compiler reports the path the arm asked for.
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn cuda_graph_dropout_forwards_capture_and_redraw_every_step_gpu() {
+    for (path, regen, compile_line) in [
+        ("key", "1", "dropout(s) keep a 32-byte key"),
+        (
+            "mask",
+            "0",
+            "NSL_DROPOUT_REGEN=0: 2 dropout(s) store an f32 mask",
+        ),
+    ] {
+        let env: &[(&str, &str)] = &[("NSL_DROPOUT_REGEN", regen)];
+        let graphs = ["--seed", "777", "--cuda-graphs"];
+        let plain = run_fixture_env(
+            "cuda_graph_gate.nsl",
+            &format!("dropctl_{path}"),
+            &[GPU_MLP, XG, YG, EPOCHS],
+            &graphs,
+            env,
+        );
+        assert!(
+            plain.success,
+            "[{path}] dropout-free run failed:\n{}",
+            plain.stderr
+        );
+        let want = banner_counters(&plain.stderr);
+        assert!(
+            want["captured"] > 0,
+            "[{path}] the control captured nothing: {want:?}"
+        );
+
+        let on = run_fixture_env(
+            "cuda_graph_gate.nsl",
+            &format!("dropon_{path}"),
+            &[GPU_MLP, XG, YG, EPOCHS, DROPOUT],
+            &graphs,
+            env,
+        );
+        assert!(
+            on.success,
+            "[{path}] graphs-on dropout run failed:\n{}",
+            on.stderr
+        );
+        assert!(
+            on.stderr.contains(compile_line),
+            "[{path}] the arm did not take its dropout path:\n{}",
+            on.stderr
+        );
+        let got = banner_counters(&on.stderr);
+        assert_eq!(
+            (got["captured"], got["replays"], got["mismatches"]),
+            (want["captured"], want["replays"], 0),
+            "[{path}] dropout keeps regions from capturing: {got:?} against {want:?} \
+             without dropout\n{}",
+            on.stderr
+        );
+
+        let off = run_fixture_env(
+            "cuda_graph_gate.nsl",
+            &format!("dropoff_{path}"),
+            &[GPU_MLP, XG, YG, EPOCHS, DROPOUT],
+            &["--seed", "777"],
+            env,
+        );
+        assert!(
+            off.success,
+            "[{path}] eager dropout run failed:\n{}",
+            off.stderr
+        );
+        assert!(
+            on.losses.len() >= 8,
+            "[{path}] loss stream too short: {:?}",
+            on.losses
+        );
+        assert_eq!(
+            on.losses, off.losses,
+            "[{path}] the replayed dropout drew other masks than the eager run"
+        );
+        assert_ne!(
+            on.losses, plain.losses,
+            "[{path}] the dropout run's losses are the dropout-free run's: dropout never ran"
+        );
+    }
+}
+
 /// Parse the `[bf16-cast-cache] hits=H recasts=R evictions=E` teardown line —
 /// same k=v line shape as the graph banner, so the same parser serves both
 /// (a parsing fix must not have to land twice).
